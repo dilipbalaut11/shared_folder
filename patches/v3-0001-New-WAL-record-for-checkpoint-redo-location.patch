@@ -1,6 +1,6 @@
-From 8f7848428a4140925507ba6b7ea38304a7159d88 Mon Sep 17 00:00:00 2001
-From: Dilip kumar <dilipkumar@dkmac.local>
-Date: Fri, 18 Aug 2023 16:47:12 +0530
+From 2fa9f78c95bbe043ba30642d3db6afb959dca418 Mon Sep 17 00:00:00 2001
+From: Dilip Kumar <dilip.kumar@enterprisedb.com>
+Date: Fri, 25 Aug 2023 05:16:54 +0000
 Subject: [PATCH v3] New WAL record for checkpoint redo location
 
 Currently, the checkpoint-redo LSN cannot be accurately detected
@@ -13,11 +13,12 @@ processed some extra records that got added after the redo LSN.
 
 The patch inserts a special wal record named CHECKPOINT_REDO
 WAL, and the checkpoint-redo location is set at the start LSN of
-this record.
+this recordi.
 
-Also after this patch now we do not need to compute the checkpoint
-redo lsn based on the current WAL insert location as we are setting
-this to the CHECKPOINT_REDO record's start LSN.
+However for shutdown checkpoint we don't need this special record
+because during shutdown there could not be any concurrent WAL
+insertion so the shutdown checkpoint record should be at the
+checkpoint-redo location.
 ---
  src/backend/access/rmgrdesc/xlogdesc.c   |  7 +++
  src/backend/access/transam/xlog.c        | 63 ++++++++++++++++++------
@@ -51,12 +52,12 @@ index f390c177e4..7868ec7633 100644
  
  	return id;
 diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
-index 60c0b7ec3a..ead48cd600 100644
+index 60c0b7ec3a..856dc55baf 100644
 --- a/src/backend/access/transam/xlog.c
 +++ b/src/backend/access/transam/xlog.c
-@@ -6520,6 +6520,31 @@ CreateCheckPoint(int flags)
- 		LWLockRelease(ControlFileLock);
- 	}
+@@ -6534,6 +6534,31 @@ CreateCheckPoint(int flags)
+ 	else
+ 		checkPoint.oldestActiveXid = InvalidTransactionId;
  
 +	/*
 +	 * Insert a dummy CHECKPOINT_REDO record and set start LSN of this record
@@ -83,9 +84,9 @@ index 60c0b7ec3a..ead48cd600 100644
 +		checkPoint.redo = ProcLastRecPtr;
 +	}
 +
- 	/* Begin filling in the checkpoint WAL record */
- 	MemSet(&checkPoint, 0, sizeof(checkPoint));
- 	checkPoint.time = (pg_time_t) time(NULL);
+ 	/*
+ 	 * Get location of last important record before acquiring insert locks (as
+ 	 * GetLastImportantRecPtr() also locks WAL locks).
 @@ -6545,7 +6570,14 @@ CreateCheckPoint(int flags)
  	 * determine the checkpoint REDO pointer.
  	 */
@@ -173,5 +174,5 @@ index dc953977c5..1136613259 100644
  
  /*
 -- 
-2.39.2 (Apple Git-143)
+2.34.1
 
