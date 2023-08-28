@@ -11,9 +11,9 @@ If we want to stop processing wal exactly at the checkpoint-redo
 location then we cannot do that because we would have already
 processed some extra records that got added after the redo LSN.
 
-The patch inserts a special wal record named CHECKPOINT_REDO
+The patch inserts a special WAL record named CHECKPOINT_REDO
 WAL, and the checkpoint-redo location is set at the start LSN of
-this recordi.
+this record.
 
 However for shutdown checkpoint we don't need this special record
 because during shutdown there could not be any concurrent WAL
