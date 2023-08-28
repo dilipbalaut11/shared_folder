@@ -1,0 +1,225 @@
+From c58cb77ec8ca903b2a5502be6646b6137cba3281 Mon Sep 17 00:00:00 2001
+From: Dilip Kumar <dilip.kumar@enterprisedb.com>
+Date: Fri, 25 Aug 2023 05:16:54 +0000
+Subject: [PATCH v4] New WAL record for checkpoint redo location
+
+Currently, the checkpoint-redo LSN cannot be accurately detected
+while processing the WAL.  Although we have a checkpoint WAL record
+containing the exact redo LSN, other WAL records may be inserted
+between the checkpoint-redo LSN and the actual checkpoint record.
+If we want to stop processing wal exactly at the checkpoint-redo
+location then we cannot do that because we would have already
+processed some extra records that got added after the redo LSN.
+
+The patch inserts a special WAL record named CHECKPOINT_REDO
+WAL, and the checkpoint-redo location is set at the start LSN of
+this record.
+
+However for shutdown checkpoint we don't need this special record
+because during shutdown there could not be any concurrent WAL
+insertion so the shutdown checkpoint record should always be at the
+checkpoint-redo location.
+---
+ .../pg_walinspect/expected/pg_walinspect.out  | 11 ++++
+ contrib/pg_walinspect/sql/pg_walinspect.sql   |  7 +++
+ src/backend/access/rmgrdesc/xlogdesc.c        |  7 +++
+ src/backend/access/transam/xlog.c             | 60 ++++++++++++++-----
+ src/backend/replication/logical/decode.c      |  1 +
+ src/include/catalog/pg_control.h              |  1 +
+ 6 files changed, 71 insertions(+), 16 deletions(-)
+
+diff --git a/contrib/pg_walinspect/expected/pg_walinspect.out b/contrib/pg_walinspect/expected/pg_walinspect.out
+index a8f4c91060..f49c6b4844 100644
+--- a/contrib/pg_walinspect/expected/pg_walinspect.out
++++ b/contrib/pg_walinspect/expected/pg_walinspect.out
+@@ -140,6 +140,17 @@ SELECT COUNT(*) >= 1 AS ok FROM pg_get_wal_block_info(:'wal_lsn5', :'wal_lsn6')
+  t
+ (1 row)
+ 
++-- ===================================================================
++-- Test presence of new REDO record at the checkpoint redo location
++-- ===================================================================
++SELECT redo_lsn FROM pg_control_checkpoint() \gset
++SELECT start_lsn = :'redo_lsn'::pg_lsn AS same_lsn, record_type
++  FROM pg_get_wal_record_info(:'redo_lsn');
++ same_lsn |   record_type   
++----------+-----------------
++ t        | CHECKPOINT_REDO
++(1 row)
++
+ -- ===================================================================
+ -- Tests for permissions
+ -- ===================================================================
+diff --git a/contrib/pg_walinspect/sql/pg_walinspect.sql b/contrib/pg_walinspect/sql/pg_walinspect.sql
+index f987ca31c4..443702d26e 100644
+--- a/contrib/pg_walinspect/sql/pg_walinspect.sql
++++ b/contrib/pg_walinspect/sql/pg_walinspect.sql
+@@ -89,6 +89,13 @@ SELECT pg_current_wal_lsn() AS wal_lsn6 \gset
+ SELECT COUNT(*) >= 1 AS ok FROM pg_get_wal_block_info(:'wal_lsn5', :'wal_lsn6')
+   WHERE relfilenode = :'sample_tbl_oid' AND block_fpi_data IS NOT NULL;
+ 
++-- ===================================================================
++-- Test presence of new REDO record at the checkpoint redo location
++-- ===================================================================
++SELECT redo_lsn FROM pg_control_checkpoint() \gset
++SELECT start_lsn = :'redo_lsn'::pg_lsn AS same_lsn, record_type
++  FROM pg_get_wal_record_info(:'redo_lsn');
++
+ -- ===================================================================
+ -- Tests for permissions
+ -- ===================================================================
+diff --git a/src/backend/access/rmgrdesc/xlogdesc.c b/src/backend/access/rmgrdesc/xlogdesc.c
+index f390c177e4..7868ec7633 100644
+--- a/src/backend/access/rmgrdesc/xlogdesc.c
++++ b/src/backend/access/rmgrdesc/xlogdesc.c
+@@ -148,6 +148,10 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
+ 						 LSN_FORMAT_ARGS(xlrec.overwritten_lsn),
+ 						 timestamptz_to_str(xlrec.overwrite_time));
+ 	}
++	else if(info == XLOG_CHECKPOINT_REDO)
++	{
++		/* No details to write out */
++	}
+ }
+ 
+ const char *
+@@ -196,6 +200,9 @@ xlog_identify(uint8 info)
+ 		case XLOG_FPI_FOR_HINT:
+ 			id = "FPI_FOR_HINT";
+ 			break;
++		case XLOG_CHECKPOINT_REDO:
++			id = "CHECKPOINT_REDO";
++			break;
+ 	}
+ 
+ 	return id;
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 60c0b7ec3a..7168e505fe 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -6468,9 +6468,7 @@ CreateCheckPoint(int flags)
+ 	XLogRecPtr	recptr;
+ 	XLogSegNo	_logSegNo;
+ 	XLogCtlInsert *Insert = &XLogCtl->Insert;
+-	uint32		freespace;
+ 	XLogRecPtr	PriorRedoPtr;
+-	XLogRecPtr	curInsert;
+ 	XLogRecPtr	last_important_lsn;
+ 	VirtualTransactionId *vxids;
+ 	int			nvxids;
+@@ -6534,6 +6532,31 @@ CreateCheckPoint(int flags)
+ 	else
+ 		checkPoint.oldestActiveXid = InvalidTransactionId;
+ 
++	/*
++	 * Insert a dummy CHECKPOINT_REDO record and set start LSN of this record
++	 * as checkpoint.redo.  Although we have the checkpoint record that also
++	 * contains the exact redo lsn, there might have been some other records
++	 * those got inserted between the redo lsn and the actual checkpoint
++	 * record.  So when processing the wal, we cannot rely on the checkpoint
++	 * record if we want to stop at the checkpoint-redo LSN.
++	 *
++	 * This special record, however, is not required when we are doing a
++	 * shutdown checkpoint, as there will be no concurrent wal insertions
++	 * during that time.  So, the shutdown checkpoint LSN will be the same as
++	 * checkpoint-redo LSN.
++	 */
++	if (!shutdown)
++	{
++		int		dummy = 0;
++
++		XLogBeginInsert();
++		XLogRegisterData((char *) &dummy, sizeof(dummy));
++		XLogInsert(RM_XLOG_ID, XLOG_CHECKPOINT_REDO);
++
++		/* store CHECKPOINT_REDO record's start location as checkpoint.redo */
++		checkPoint.redo = ProcLastRecPtr;
++	}
++
+ 	/*
+ 	 * Get location of last important record before acquiring insert locks (as
+ 	 * GetLastImportantRecPtr() also locks WAL locks).
+@@ -6545,7 +6568,6 @@ CreateCheckPoint(int flags)
+ 	 * determine the checkpoint REDO pointer.
+ 	 */
+ 	WALInsertLockAcquireExclusive();
+-	curInsert = XLogBytePosToRecPtr(Insert->CurrBytePos);
+ 
+ 	/*
+ 	 * If this isn't a shutdown or forced checkpoint, and if there has been no
+@@ -6582,22 +6604,24 @@ CreateCheckPoint(int flags)
+ 	checkPoint.fullPageWrites = Insert->fullPageWrites;
+ 
+ 	/*
+-	 * Compute new REDO record ptr = location of next XLOG record.
+-	 *
+-	 * NB: this is NOT necessarily where the checkpoint record itself will be,
+-	 * since other backends may insert more XLOG records while we're off doing
+-	 * the buffer flush work.  Those XLOG records are logically after the
+-	 * checkpoint, even though physically before it.  Got that?
++	 * In case of shutdown checkpoint, compute new REDO record
++	 * ptr = location of next XLOG record.  For regular checkpoint we have
++	 * already set it to the CHECKPOINT_REDO so nothing to be done for that.
+ 	 */
+-	freespace = INSERT_FREESPACE(curInsert);
+-	if (freespace == 0)
++	if (shutdown)
+ 	{
+-		if (XLogSegmentOffset(curInsert, wal_segment_size) == 0)
+-			curInsert += SizeOfXLogLongPHD;
+-		else
+-			curInsert += SizeOfXLogShortPHD;
++		XLogRecPtr	curInsert = XLogBytePosToRecPtr(Insert->CurrBytePos);
++		uint32		freespace = INSERT_FREESPACE(curInsert);
++
++		if (freespace == 0)
++		{
++			if (XLogSegmentOffset(curInsert, wal_segment_size) == 0)
++				curInsert += SizeOfXLogLongPHD;
++			else
++				curInsert += SizeOfXLogShortPHD;
++		}
++		checkPoint.redo = curInsert;
+ 	}
+-	checkPoint.redo = curInsert;
+ 
+ 	/*
+ 	 * Here we update the shared RedoRecPtr for future XLogInsert calls; this
+@@ -8074,6 +8098,10 @@ xlog_redo(XLogReaderState *record)
+ 		/* Keep track of full_page_writes */
+ 		lastFullPageWrites = fpw;
+ 	}
++	else if (info == XLOG_CHECKPOINT_REDO)
++	{
++		/* nothing to do here */
++	}
+ }
+ 
+ /*
+diff --git a/src/backend/replication/logical/decode.c b/src/backend/replication/logical/decode.c
+index 7039d425e2..89978c2fd8 100644
+--- a/src/backend/replication/logical/decode.c
++++ b/src/backend/replication/logical/decode.c
+@@ -190,6 +190,7 @@ xlog_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
+ 		case XLOG_FPI_FOR_HINT:
+ 		case XLOG_FPI:
+ 		case XLOG_OVERWRITE_CONTRECORD:
++		case XLOG_CHECKPOINT_REDO:
+ 			break;
+ 		default:
+ 			elog(ERROR, "unexpected RM_XLOG_ID record type: %u", info);
+diff --git a/src/include/catalog/pg_control.h b/src/include/catalog/pg_control.h
+index dc953977c5..1136613259 100644
+--- a/src/include/catalog/pg_control.h
++++ b/src/include/catalog/pg_control.h
+@@ -78,6 +78,7 @@ typedef struct CheckPoint
+ #define XLOG_FPI						0xB0
+ /* 0xC0 is used in Postgres 9.5-11 */
+ #define XLOG_OVERWRITE_CONTRECORD		0xD0
++#define XLOG_CHECKPOINT_REDO			0xE0
+ 
+ 
+ /*
+-- 
+2.34.1
+
