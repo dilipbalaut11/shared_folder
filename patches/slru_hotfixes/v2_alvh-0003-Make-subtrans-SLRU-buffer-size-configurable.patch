@@ -1,0 +1,155 @@
+From 85d93ae3be15e050117f20b3958f12e78278747f Mon Sep 17 00:00:00 2001
+From: Andrey Borodin <amborodin@acm.org>
+Date: Mon, 15 Feb 2021 21:51:56 +0500
+Subject: [PATCH v2_alvh 3/5] Make subtrans SLRU buffer size configurable
+
+Provide new GUCs to set the number of buffers, instead of using hard
+coded defaults.
+
+This is a cut-down version of patch v16 from Andrey Borodin and Thomas
+Munro posted at
+https://postgr.es/m/CA+hUKGLCLDtgDj2Xsf0uBk5WXDCeHxBDDJPsyY7m65Fde-=pyg@mail.gmail.com
+where only the subtrans SLRU is modified, and none of the other SLRUs
+as in Borodin/Munro patch.
+---
+ doc/src/sgml/config.sgml                      | 21 ++++++++++++++++++-
+ src/backend/access/transam/subtrans.c         |  5 +++--
+ src/backend/utils/init/globals.c              |  1 +
+ src/backend/utils/misc/guc.c                  | 11 ++++++++++
+ src/backend/utils/misc/postgresql.conf.sample |  1 +
+ src/include/access/subtrans.h                 |  2 --
+ src/include/miscadmin.h                       |  1 +
+ 7 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index ae320a7e736..a587c6f740a 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -1866,7 +1866,26 @@ include_dir 'conf.d'
+        </para>
+       </listitem>
+      </varlistentry>
+-     
++
++     <varlistentry id="guc-subtrans-buffers" xreflabel="subtrans_buffers">
++      <term><varname>subtrans_buffers</varname> (<type>integer</type>)
++      <indexterm>
++       <primary><varname>subtrans_buffers</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies the amount of shared memory to use to cache the contents
++        of <literal>pg_subtrans</literal> (see
++        <xref linkend="pgdata-contents-table"/>).
++        If this value is specified without units, it is taken as blocks,
++        that is <symbol>BLCKSZ</symbol> bytes, typically 8kB.
++        The default value is <literal>8</literal>.
++        This parameter can only be set at server start.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="guc-max-stack-depth" xreflabel="max_stack_depth">
+       <term><varname>max_stack_depth</varname> (<type>integer</type>)
+       <indexterm>
+diff --git a/src/backend/access/transam/subtrans.c b/src/backend/access/transam/subtrans.c
+index 2eb1a26114e..34bb9497fab 100644
+--- a/src/backend/access/transam/subtrans.c
++++ b/src/backend/access/transam/subtrans.c
+@@ -31,6 +31,7 @@
+ #include "access/slru.h"
+ #include "access/subtrans.h"
+ #include "access/transam.h"
++#include "miscadmin.h"
+ #include "pg_trace.h"
+ #include "utils/snapmgr.h"
+ 
+@@ -184,14 +185,14 @@ SubTransGetTopmostTransaction(TransactionId xid)
+ Size
+ SUBTRANSShmemSize(void)
+ {
+-	return SimpleLruShmemSize(NUM_SUBTRANS_BUFFERS, 0);
++	return SimpleLruShmemSize(subtrans_buffers, 0);
+ }
+ 
+ void
+ SUBTRANSShmemInit(void)
+ {
+ 	SubTransCtl->PagePrecedes = SubTransPagePrecedes;
+-	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0,
++	SimpleLruInit(SubTransCtl, "Subtrans", subtrans_buffers, 0,
+ 				  SubtransSLRULock, "pg_subtrans",
+ 				  LWTRANCHE_SUBTRANS_BUFFER);
+ 	/* Override default assumption that writes should be fsync'd */
+diff --git a/src/backend/utils/init/globals.c b/src/backend/utils/init/globals.c
+index 7239949ee06..2039779704b 100644
+--- a/src/backend/utils/init/globals.c
++++ b/src/backend/utils/init/globals.c
+@@ -152,3 +152,4 @@ double		vacuum_cleanup_index_scale_factor;
+ 
+ int			multixact_offsets_buffers = 8;
+ int			multixact_members_buffers = 16;
++int			subtrans_buffers = 32;
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 757380f3ad0..c78f8e13ebe 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -2285,6 +2285,17 @@ static struct config_int ConfigureNamesInt[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"subtrans_buffers", PGC_POSTMASTER, RESOURCES_MEM,
++			gettext_noop("Sets the number of shared memory buffers used for the sub-transaction SLRU cache."),
++			NULL,
++			GUC_UNIT_BLOCKS
++		},
++		&subtrans_buffers,
++		32, 2, SLRU_MAX_ALLOWED_BUFFERS,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"temp_buffers", PGC_USERSET, RESOURCES_MEM,
+ 			gettext_noop("Sets the maximum number of temporary buffers used by each session."),
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index d8549981453..3c993e7b239 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -189,6 +189,7 @@
+ 
+ # - SLRU Buffers (change requires restart) -
+ 
++#subtrans_buffers = 32				# memory for pg_subtrans
+ #multixact_offsets_buffers = 8		# memory for pg_multixact/offsets
+ #multixact_members_buffers = 16		# memory for pg_multixact/members
+ 
+diff --git a/src/include/access/subtrans.h b/src/include/access/subtrans.h
+index 2bab8e2097d..6099868c4ad 100644
+--- a/src/include/access/subtrans.h
++++ b/src/include/access/subtrans.h
+@@ -11,8 +11,6 @@
+ #ifndef SUBTRANS_H
+ #define SUBTRANS_H
+ 
+-/* Number of SLRU buffers to use for subtrans */
+-#define NUM_SUBTRANS_BUFFERS	32
+ 
+ extern void SubTransSetParent(TransactionId xid, TransactionId parent);
+ extern TransactionId SubTransGetParent(TransactionId xid);
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index d3a03f25fff..bae122310c7 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -175,6 +175,7 @@ extern PGDLLIMPORT int max_worker_processes;
+ extern PGDLLIMPORT int max_parallel_workers;
+ extern PGDLLIMPORT int multixact_offsets_buffers;
+ extern PGDLLIMPORT int multixact_members_buffers;
++extern PGDLLIMPORT int subtrans_buffers;
+ 
+ extern PGDLLIMPORT int MyProcPid;
+ extern PGDLLIMPORT pg_time_t MyStartTime;
+-- 
+2.39.2
+

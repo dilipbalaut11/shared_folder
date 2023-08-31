@@ -1,0 +1,217 @@
+From 2d0cd74532d9d08ff86ca3ef70cdb7d91607b31e Mon Sep 17 00:00:00 2001
+From: Andrey Borodin <amborodin@acm.org>
+Date: Mon, 15 Feb 2021 21:51:56 +0500
+Subject: [PATCH v2_alvh 2/5] Make multixact SLRU buffer sizes configurable
+
+Provide new GUCs to set the number of buffers, instead of using hard
+coded defaults.
+
+This is a cut-down version of patch v16 from Andrey Borodin and Thomas
+Munro posted at
+https://postgr.es/m/CA+hUKGLCLDtgDj2Xsf0uBk5WXDCeHxBDDJPsyY7m65Fde-=pyg@mail.gmail.com
+where only the multixact SLRUs are modified, and none of the other SLRUs
+as in Borodin/Munro patch.
+---
+ doc/src/sgml/config.sgml                      | 38 +++++++++++++++++++
+ src/backend/access/transam/multixact.c        |  8 ++--
+ src/backend/utils/init/globals.c              |  3 ++
+ src/backend/utils/misc/guc.c                  | 23 +++++++++++
+ src/backend/utils/misc/postgresql.conf.sample |  4 ++
+ src/include/access/multixact.h                |  4 --
+ src/include/access/slru.h                     |  5 +++
+ src/include/miscadmin.h                       |  2 +
+ 8 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index 7ed40f15363..ae320a7e736 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -1829,6 +1829,44 @@ include_dir 'conf.d'
+       </listitem>
+      </varlistentry>
+ 
++    <varlistentry id="guc-multixact-offsets-buffers" xreflabel="multixact_offsets_buffers">
++      <term><varname>multixact_offsets_buffers</varname> (<type>integer</type>)
++      <indexterm>
++       <primary><varname>multixact_offsets_buffers</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies the amount of shared memory to use to cache the contents
++        of <literal>pg_multixact/offsets</literal> (see
++        <xref linkend="pgdata-contents-table"/>).
++        If this value is specified without units, it is taken as blocks,
++        that is <symbol>BLCKSZ</symbol> bytes, typically 8kB.
++        The default value is <literal>8</literal>.
++        This parameter can only be set at server start.
++       </para>
++      </listitem>
++     </varlistentry>
++
++    <varlistentry id="guc-multixact-members-buffers" xreflabel="multixact_members_buffers">
++      <term><varname>multixact_members_buffers</varname> (<type>integer</type>)
++      <indexterm>
++       <primary><varname>multixact_members_buffers</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Specifies the amount of shared memory to use to cache the contents
++        of <literal>pg_multixact/members</literal> (see
++        <xref linkend="pgdata-contents-table"/>).
++        If this value is specified without units, it is taken as blocks,
++        that is <symbol>BLCKSZ</symbol> bytes, typically 8kB.
++        The default value is <literal>16</literal>.
++        This parameter can only be set at server start.
++       </para>
++      </listitem>
++     </varlistentry>
++     
+      <varlistentry id="guc-max-stack-depth" xreflabel="max_stack_depth">
+       <term><varname>max_stack_depth</varname> (<type>integer</type>)
+       <indexterm>
+diff --git a/src/backend/access/transam/multixact.c b/src/backend/access/transam/multixact.c
+index 383c991ced2..af3f9c67363 100644
+--- a/src/backend/access/transam/multixact.c
++++ b/src/backend/access/transam/multixact.c
+@@ -1816,8 +1816,8 @@ MultiXactShmemSize(void)
+ 			 mul_size(sizeof(MultiXactId) * 2, MaxOldestSlot))
+ 
+ 	size = SHARED_MULTIXACT_STATE_SIZE;
+-	size = add_size(size, SimpleLruShmemSize(NUM_MULTIXACTOFFSET_BUFFERS, 0));
+-	size = add_size(size, SimpleLruShmemSize(NUM_MULTIXACTMEMBER_BUFFERS, 0));
++	size = add_size(size, SimpleLruShmemSize(multixact_offsets_buffers, 0));
++	size = add_size(size, SimpleLruShmemSize(multixact_members_buffers, 0));
+ 
+ 	return size;
+ }
+@@ -1833,12 +1833,12 @@ MultiXactShmemInit(void)
+ 	MultiXactMemberCtl->PagePrecedes = MultiXactMemberPagePrecedes;
+ 
+ 	SimpleLruInit(MultiXactOffsetCtl,
+-				  "MultiXactOffset", NUM_MULTIXACTOFFSET_BUFFERS, 0,
++				  "MultiXactOffset", multixact_offsets_buffers, 0,
+ 				  MultiXactOffsetSLRULock, "pg_multixact/offsets",
+ 				  LWTRANCHE_MULTIXACTOFFSET_BUFFER);
+ 	SlruPagePrecedesUnitTests(MultiXactOffsetCtl, MULTIXACT_OFFSETS_PER_PAGE);
+ 	SimpleLruInit(MultiXactMemberCtl,
+-				  "MultiXactMember", NUM_MULTIXACTMEMBER_BUFFERS, 0,
++				  "MultiXactMember", multixact_offsets_buffers, 0,
+ 				  MultiXactMemberSLRULock, "pg_multixact/members",
+ 				  LWTRANCHE_MULTIXACTMEMBER_BUFFER);
+ 	/* doesn't call SimpleLruTruncate() or meet criteria for unit tests */
+diff --git a/src/backend/utils/init/globals.c b/src/backend/utils/init/globals.c
+index 9793354a02f..7239949ee06 100644
+--- a/src/backend/utils/init/globals.c
++++ b/src/backend/utils/init/globals.c
+@@ -149,3 +149,6 @@ int			VacuumCostBalance = 0;	/* working state for vacuum */
+ bool		VacuumCostActive = false;
+ 
+ double		vacuum_cleanup_index_scale_factor;
++
++int			multixact_offsets_buffers = 8;
++int			multixact_members_buffers = 16;
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 98651b473a9..757380f3ad0 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -29,6 +29,7 @@
+ #include "access/commit_ts.h"
+ #include "access/gin.h"
+ #include "access/rmgr.h"
++#include "access/slru.h"
+ #include "access/tableam.h"
+ #include "access/transam.h"
+ #include "access/twophase.h"
+@@ -2262,6 +2263,28 @@ static struct config_int ConfigureNamesInt[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"multixact_offsets_buffers", PGC_POSTMASTER, RESOURCES_MEM,
++			gettext_noop("Sets the number of shared memory buffers used for the MultiXact offset SLRU cache."),
++			NULL,
++			GUC_UNIT_BLOCKS
++		},
++		&multixact_offsets_buffers,
++		8, 2, SLRU_MAX_ALLOWED_BUFFERS,
++		NULL, NULL, NULL
++	},
++
++	{
++		{"multixact_members_buffers", PGC_POSTMASTER, RESOURCES_MEM,
++			gettext_noop("Sets the number of shared memory buffers used for the MultiXact member SLRU cache."),
++			NULL,
++			GUC_UNIT_BLOCKS
++		},
++		&multixact_members_buffers,
++		16, 2, SLRU_MAX_ALLOWED_BUFFERS,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"temp_buffers", PGC_USERSET, RESOURCES_MEM,
+ 			gettext_noop("Sets the maximum number of temporary buffers used by each session."),
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 110d9bae939..d8549981453 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -187,6 +187,10 @@
+ 					# (change requires restart)
+ #backend_flush_after = 0		# measured in pages, 0 disables
+ 
++# - SLRU Buffers (change requires restart) -
++
++#multixact_offsets_buffers = 8		# memory for pg_multixact/offsets
++#multixact_members_buffers = 16		# memory for pg_multixact/members
+ 
+ #------------------------------------------------------------------------------
+ # WRITE-AHEAD LOG
+diff --git a/src/include/access/multixact.h b/src/include/access/multixact.h
+index 6d729008c60..848398bf1ed 100644
+--- a/src/include/access/multixact.h
++++ b/src/include/access/multixact.h
+@@ -28,10 +28,6 @@
+ 
+ #define MaxMultiXactOffset	((MultiXactOffset) 0xFFFFFFFF)
+ 
+-/* Number of SLRU buffers to use for multixact */
+-#define NUM_MULTIXACTOFFSET_BUFFERS		8
+-#define NUM_MULTIXACTMEMBER_BUFFERS		16
+-
+ /*
+  * Possible multixact lock modes ("status").  The first four modes are for
+  * tuple locks (FOR KEY SHARE, FOR SHARE, FOR NO KEY UPDATE, FOR UPDATE); the
+diff --git a/src/include/access/slru.h b/src/include/access/slru.h
+index 62d20b37ad2..44d8d0e9194 100644
+--- a/src/include/access/slru.h
++++ b/src/include/access/slru.h
+@@ -17,6 +17,11 @@
+ #include "storage/lwlock.h"
+ #include "utils/hsearch.h"
+ 
++/*
++ * To avoid overflowing internal arithmetic and the size_t data type, the
++ * number of buffers should not exceed this number.
++ */
++#define SLRU_MAX_ALLOWED_BUFFERS ((1024 * 1024 * 1024) / BLCKSZ)
+ 
+ /*
+  * Define SLRU segment size.  A page is the same BLCKSZ as is used everywhere
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 6b2b4343a0d..d3a03f25fff 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -173,6 +173,8 @@ extern PGDLLIMPORT int MaxBackends;
+ extern PGDLLIMPORT int MaxConnections;
+ extern PGDLLIMPORT int max_worker_processes;
+ extern PGDLLIMPORT int max_parallel_workers;
++extern PGDLLIMPORT int multixact_offsets_buffers;
++extern PGDLLIMPORT int multixact_members_buffers;
+ 
+ extern PGDLLIMPORT int MyProcPid;
+ extern PGDLLIMPORT pg_time_t MyStartTime;
+-- 
+2.39.2
+

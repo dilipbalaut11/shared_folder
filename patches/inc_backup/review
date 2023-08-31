@@ -1,0 +1,7 @@
+1.
+
++			BlockNumber relative_block_numbers[RELSEG_SIZE];
+
+This is close to 400kB of memory, so I think better we palloc it instead of keeping in the stack.
+
+2.

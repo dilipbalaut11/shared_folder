@@ -1,0 +1,79 @@
+From f7f00f5a0df7ef9a0d551aa6db79eb69177254d7 Mon Sep 17 00:00:00 2001
+From: Thomas Munro <thomas.munro@gmail.com>
+Date: Thu, 8 Apr 2021 12:18:25 +1200
+Subject: [PATCH v2_alvh 4/5] Limit SLRU buffer replacement search.
+
+Now that users can configure large SLRU caches, slru.c's simple buffer
+replacement algorithm needs some adjustment.  For now, limit its linear
+search for the least recently accessed buffer to an arbitrary cap.  This
+means it won't find the globally least recently used buffer, just the
+least recently used in a given range of pages.
+
+Author: Thomas Munro
+Discussion: https://postgr.es/m/2BEC2B3F-9B61-4C1D-9FB5-5FAB0F05EF86%40yandex-team.ru
+---
+ src/backend/access/transam/slru.c | 14 +++++++++++++-
+ src/include/access/slru.h         |  3 +++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/access/transam/slru.c b/src/backend/access/transam/slru.c
+index ae382d85386..22dd18f9cf3 100644
+--- a/src/backend/access/transam/slru.c
++++ b/src/backend/access/transam/slru.c
+@@ -72,6 +72,12 @@
+  */
+ #define MAX_FLUSH_BUFFERS	16
+ 
++/*
++ * When searching for buffers to replace, we will limit the scope of our search
++ * for now, to avoid holding an exclusive lock for too long.
++ */
++#define MAX_REPLACEMENT_SEARCH	128
++
+ typedef struct SlruFlushData
+ {
+ 	int			num_files;		/* # files actually open */
+@@ -1064,6 +1070,7 @@ SlruSelectLRUPage(SlruCtl ctl, int pageno)
+ 		int			bestinvalidslot = 0;	/* keep compiler quiet */
+ 		int			best_invalid_delta = -1;
+ 		int			best_invalid_page_number = 0;	/* keep compiler quiet */
++		int			max_search;
+ 
+ 		/* See if page already has a buffer assigned */
+ 		slotno = SlruMappingFind(ctl, pageno);
+@@ -1101,12 +1108,17 @@ SlruSelectLRUPage(SlruCtl ctl, int pageno)
+ 		 * That gets us back on the path to having good data when there are
+ 		 * multiple pages with the same lru_count.
+ 		 */
++		max_search = Min(shared->num_slots, MAX_REPLACEMENT_SEARCH);
+ 		cur_count = (shared->cur_lru_count)++;
+-		for (slotno = 0; slotno < shared->num_slots; slotno++)
++		for (int i = 0; i < max_search; ++i)
+ 		{
+ 			int			this_delta;
+ 			int			this_page_number;
+ 
++			slotno = shared->search_slotno++;
++			if (shared->search_slotno == shared->num_slots)
++				shared->search_slotno = 0;
++
+ 			if (shared->page_status[slotno] == SLRU_PAGE_EMPTY)
+ 				return slotno;
+ 			this_delta = cur_count - shared->page_lru_count[slotno];
+diff --git a/src/include/access/slru.h b/src/include/access/slru.h
+index 44d8d0e9194..722d2aa0c7c 100644
+--- a/src/include/access/slru.h
++++ b/src/include/access/slru.h
+@@ -62,6 +62,9 @@ typedef struct SlruSharedData
+ 	/* Number of buffers managed by this SLRU structure */
+ 	int			num_slots;
+ 
++	/* Where to start buffer replacement search. */
++	int			search_slotno;
++
+ 	/*
+ 	 * Arrays holding info for each buffer slot.  Page number is undefined
+ 	 * when status is EMPTY, as is page_lru_count.
+-- 
+2.39.2
+

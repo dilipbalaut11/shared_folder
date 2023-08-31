@@ -1,0 +1,292 @@
+From 3b47db63b2fd0cadfc24cc284699518deb178cec Mon Sep 17 00:00:00 2001
+From: Thomas Munro <thomas.munro@gmail.com>
+Date: Thu, 25 Mar 2021 10:11:31 +1300
+Subject: [PATCH v2_alvh 1/5] Add a buffer mapping table for SLRUs.
+
+Instead of doing a linear search for the buffer holding a given page
+number, use a hash table.  This will allow us to increase the size of
+these caches.
+
+NOTE: This patch is authored by Thomas Munro (v16) and posted under the
+PostgreSQL license here:
+https://postgr.es/m/CA+hUKGLCLDtgDj2Xsf0uBk5WXDCeHxBDDJPsyY7m65Fde-=pyg@mail.gmail.com
+
+Reviewed-by: Andrey M. Borodin <x4mmm@yandex-team.ru>
+Discussion: https://postgr.es/m/2BEC2B3F-9B61-4C1D-9FB5-5FAB0F05EF86%40yandex-team.ru
+---
+ src/backend/access/transam/slru.c | 121 +++++++++++++++++++++++++-----
+ src/include/access/slru.h         |   2 +
+ 2 files changed, 103 insertions(+), 20 deletions(-)
+
+diff --git a/src/backend/access/transam/slru.c b/src/backend/access/transam/slru.c
+index c19a1a6808d..ae382d85386 100644
+--- a/src/backend/access/transam/slru.c
++++ b/src/backend/access/transam/slru.c
+@@ -58,6 +58,7 @@
+ #include "pgstat.h"
+ #include "storage/fd.h"
+ #include "storage/shmem.h"
++#include "utils/hsearch.h"
+ 
+ #define SlruFileName(ctl, path, seg) \
+ 	snprintf(path, MAXPGPATH, "%s/%04X", (ctl)->Dir, seg)
+@@ -80,6 +81,12 @@ typedef struct SlruFlushData
+ 
+ typedef struct SlruFlushData *SlruFlush;
+ 
++typedef struct SlruMappingTableEntry
++{
++	int			pageno;
++	int			slotno;
++} SlruMappingTableEntry;
++
+ /*
+  * Macro to mark a buffer slot "most recently used".  Note multiple evaluation
+  * of arguments!
+@@ -135,13 +142,16 @@ static int	SlruSelectLRUPage(SlruCtl ctl, int pageno);
+ static bool SlruScanDirCbDeleteCutoff(SlruCtl ctl, char *filename,
+ 									  int segpage, void *data);
+ static void SlruInternalDeleteSegment(SlruCtl ctl, char *filename);
++static void	SlruMappingAdd(SlruCtl ctl, int pageno, int slotno);
++static void	SlruMappingRemove(SlruCtl ctl, int pageno);
++static int	SlruMappingFind(SlruCtl ctl, int pageno);
+ 
+ /*
+  * Initialization of shared memory
+  */
+ 
+-Size
+-SimpleLruShmemSize(int nslots, int nlsns)
++static Size
++SimpleLruStructSize(int nslots, int nlsns)
+ {
+ 	Size		sz;
+ 
+@@ -156,10 +166,16 @@ SimpleLruShmemSize(int nslots, int nlsns)
+ 
+ 	if (nlsns > 0)
+ 		sz += MAXALIGN(nslots * nlsns * sizeof(XLogRecPtr));	/* group_lsn[] */
+-
+ 	return BUFFERALIGN(sz) + BLCKSZ * nslots;
+ }
+ 
++Size
++SimpleLruShmemSize(int nslots, int nlsns)
++{
++	return SimpleLruStructSize(nslots, nlsns) +
++		hash_estimate_size(nslots, sizeof(SlruMappingTableEntry));
++}
++
+ /*
+  * Initialize, or attach to, a simple LRU cache in shared memory.
+  *
+@@ -175,11 +191,14 @@ void
+ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
+ 			  LWLock *ctllock, const char *subdir, int tranche_id)
+ {
++	char		mapping_table_name[SHMEM_INDEX_KEYSIZE];
++	HASHCTL		mapping_table_info;
++	HTAB	   *mapping_table;
+ 	SlruShared	shared;
+ 	bool		found;
+ 
+ 	shared = (SlruShared) ShmemInitStruct(name,
+-										  SimpleLruShmemSize(nslots, nlsns),
++										  SimpleLruStructSize(nslots, nlsns),
+ 										  &found);
+ 
+ 	if (!IsUnderPostmaster)
+@@ -246,11 +265,21 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
+ 	else
+ 		Assert(found);
+ 
++	/* Create or find the buffer mapping table. */
++	memset(&mapping_table_info, 0, sizeof(mapping_table_info));
++	mapping_table_info.keysize = sizeof(int);
++	mapping_table_info.entrysize = sizeof(SlruMappingTableEntry);
++	snprintf(mapping_table_name, sizeof(mapping_table_name),
++			 "%s Lookup Table", name);
++	mapping_table = ShmemInitHash(mapping_table_name, nslots, nslots,
++								  &mapping_table_info, HASH_ELEM | HASH_BLOBS);
++
+ 	/*
+ 	 * Initialize the unshared control struct, including directory path. We
+ 	 * assume caller set PagePrecedes.
+ 	 */
+ 	ctl->shared = shared;
++	ctl->mapping_table = mapping_table;
+ 	ctl->do_fsync = true;		/* default behavior */
+ 	StrNCpy(ctl->Dir, subdir, sizeof(ctl->Dir));
+ }
+@@ -277,6 +306,9 @@ SimpleLruZeroPage(SlruCtl ctl, int pageno)
+ 		   shared->page_number[slotno] == pageno);
+ 
+ 	/* Mark the slot as containing this page */
++	if (shared->page_status[slotno] != SLRU_PAGE_EMPTY)
++		SlruMappingRemove(ctl, shared->page_number[slotno]);
++	SlruMappingAdd(ctl, pageno, slotno);
+ 	shared->page_number[slotno] = pageno;
+ 	shared->page_status[slotno] = SLRU_PAGE_VALID;
+ 	shared->page_dirty[slotno] = true;
+@@ -350,7 +382,10 @@ SimpleLruWaitIO(SlruCtl ctl, int slotno)
+ 		{
+ 			/* indeed, the I/O must have failed */
+ 			if (shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS)
++			{
++				SlruMappingRemove(ctl, shared->page_number[slotno]);
+ 				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
++			}
+ 			else				/* write_in_progress */
+ 			{
+ 				shared->page_status[slotno] = SLRU_PAGE_VALID;
+@@ -424,6 +459,9 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
+ 				!shared->page_dirty[slotno]));
+ 
+ 		/* Mark the slot read-busy */
++		if (shared->page_status[slotno] != SLRU_PAGE_EMPTY)
++			SlruMappingRemove(ctl, shared->page_number[slotno]);
++		SlruMappingAdd(ctl, pageno, slotno);
+ 		shared->page_number[slotno] = pageno;
+ 		shared->page_status[slotno] = SLRU_PAGE_READ_IN_PROGRESS;
+ 		shared->page_dirty[slotno] = false;
+@@ -447,7 +485,13 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok,
+ 			   shared->page_status[slotno] == SLRU_PAGE_READ_IN_PROGRESS &&
+ 			   !shared->page_dirty[slotno]);
+ 
+-		shared->page_status[slotno] = ok ? SLRU_PAGE_VALID : SLRU_PAGE_EMPTY;
++		if (ok)
++			shared->page_status[slotno] = SLRU_PAGE_VALID;
++		else
++		{
++			SlruMappingRemove(ctl, pageno);
++			shared->page_status[slotno] =  SLRU_PAGE_EMPTY;
++		}
+ 
+ 		LWLockRelease(&shared->buffer_locks[slotno].lock);
+ 
+@@ -488,20 +532,20 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int pageno, TransactionId xid)
+ 	LWLockAcquire(shared->ControlLock, LW_SHARED);
+ 
+ 	/* See if page is already in a buffer */
+-	for (slotno = 0; slotno < shared->num_slots; slotno++)
++	slotno = SlruMappingFind(ctl, pageno);
++	if (slotno >= 0 &&
++		shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
+ 	{
+-		if (shared->page_number[slotno] == pageno &&
+-			shared->page_status[slotno] != SLRU_PAGE_EMPTY &&
+-			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
+-		{
+-			/* See comments for SlruRecentlyUsed macro */
+-			SlruRecentlyUsed(shared, slotno);
++		Assert(shared->page_status[slotno] != SLRU_PAGE_EMPTY);
++		Assert(shared->page_number[slotno] == pageno);
+ 
+-			/* update the stats counter of pages found in the SLRU */
+-			pgstat_count_slru_page_hit(shared->slru_stats_idx);
++		/* See comments for SlruRecentlyUsed macro */
++		SlruRecentlyUsed(shared, slotno);
+ 
+-			return slotno;
+-		}
++		/* update the stats counter of pages found in the SLRU */
++		pgstat_count_slru_page_hit(shared->slru_stats_idx);
++
++		return slotno;
+ 	}
+ 
+ 	/* No luck, so switch to normal exclusive lock and do regular read */
+@@ -1022,11 +1066,12 @@ SlruSelectLRUPage(SlruCtl ctl, int pageno)
+ 		int			best_invalid_page_number = 0;	/* keep compiler quiet */
+ 
+ 		/* See if page already has a buffer assigned */
+-		for (slotno = 0; slotno < shared->num_slots; slotno++)
++		slotno = SlruMappingFind(ctl, pageno);
++		if (slotno >= 0)
+ 		{
+-			if (shared->page_number[slotno] == pageno &&
+-				shared->page_status[slotno] != SLRU_PAGE_EMPTY)
+-				return slotno;
++			Assert(shared->page_number[slotno] == pageno);
++			Assert(shared->page_status[slotno] != SLRU_PAGE_EMPTY);
++			return slotno;
+ 		}
+ 
+ 		/*
+@@ -1266,6 +1311,7 @@ restart:;
+ 		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
+ 			!shared->page_dirty[slotno])
+ 		{
++			SlruMappingRemove(ctl, shared->page_number[slotno]);
+ 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+ 			continue;
+ 		}
+@@ -1340,6 +1386,7 @@ restart:
+ 		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
+ 			!shared->page_dirty[slotno])
+ 		{
++			SlruMappingRemove(ctl, shared->page_number[slotno]);
+ 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+ 			continue;
+ 		}
+@@ -1576,3 +1623,37 @@ SlruScanDirectory(SlruCtl ctl, SlruScanCallback callback, void *data)
+ 
+ 	return retval;
+ }
++
++static int
++SlruMappingFind(SlruCtl ctl, int pageno)
++{
++	SlruMappingTableEntry *mapping;
++
++	mapping = hash_search(ctl->mapping_table, &pageno, HASH_FIND, NULL);
++	if (mapping)
++		return mapping->slotno;
++
++	return -1;
++}
++
++static void
++SlruMappingAdd(SlruCtl ctl, int pageno, int slotno)
++{
++	SlruMappingTableEntry *mapping;
++	bool		found PG_USED_FOR_ASSERTS_ONLY;
++
++	mapping = hash_search(ctl->mapping_table, &pageno, HASH_ENTER, &found);
++	mapping->slotno = slotno;
++
++	Assert(!found);
++}
++
++static void
++SlruMappingRemove(SlruCtl ctl, int pageno)
++{
++	bool		found PG_USED_FOR_ASSERTS_ONLY;
++
++	hash_search(ctl->mapping_table, &pageno, HASH_REMOVE, &found);
++
++	Assert(found);
++}
+diff --git a/src/include/access/slru.h b/src/include/access/slru.h
+index 19982f6e226..62d20b37ad2 100644
+--- a/src/include/access/slru.h
++++ b/src/include/access/slru.h
+@@ -15,6 +15,7 @@
+ 
+ #include "access/xlogdefs.h"
+ #include "storage/lwlock.h"
++#include "utils/hsearch.h"
+ 
+ 
+ /*
+@@ -109,6 +110,7 @@ typedef SlruSharedData *SlruShared;
+ typedef struct SlruCtlData
+ {
+ 	SlruShared	shared;
++	HTAB	   *mapping_table;
+ 
+ 	/*
+ 	 * This flag tells whether to fsync writes (true for pg_xact and multixact
+-- 
+2.39.2
+
