@@ -1,7 +1,7 @@
-From f814b8e45e6aa39942de8bc169872e5b97b5e92c Mon Sep 17 00:00:00 2001
+From a554c2fa8b85654b435718d81453d2068ec2e155 Mon Sep 17 00:00:00 2001
 From: Hayato Kuroda <kuroda.hayato@fujitsu.com>
 Date: Tue, 4 Apr 2023 05:49:34 +0000
-Subject: [PATCH v28 2/3] pg_upgrade: Allow to replicate logical replication
+Subject: [PATCH v29 2/2] pg_upgrade: Allow to replicate logical replication
  slots to new node
 
 This commit allows nodes with logical replication slots to be upgraded. While
@@ -10,6 +10,9 @@ fetched. At the later part of upgrading, pg_upgrade revisits the list and
 restores slots by executing pg_create_logical_replication_slots() on the new
 cluster. Migration of logical replication slots is only supported when the old
 cluster is version 17.0 or later.
+
+If the old node has slots with the status 'lost' or with unconsumed WAL records,
+the pg_upgrade fails. These checks are needed to prevent data loss.
 
 Note that slot restoration must be done after the final pg_resetwal command
 during the upgrade because pg_resetwal will remove WALs that are required by
@@ -25,23 +28,25 @@ enables seamless continuation of logical replication, even after an upgrade.
 
 Author: Hayato Kuroda
 Co-authored-by: Hou Zhijie
-Reviewed-by: Peter Smith, Julien Rouhaud, Vignesh C, Wang Wei, Masahiko Sawada
+Reviewed-by: Peter Smith, Julien Rouhaud, Vignesh C, Wang Wei, Masahiko Sawada,
+             Dilip Kumar
 ---
- doc/src/sgml/ref/pgupgrade.sgml               |  70 ++++++++-
+ doc/src/sgml/ref/pgupgrade.sgml               |  70 +++++-
  src/bin/pg_upgrade/Makefile                   |   3 +
- src/bin/pg_upgrade/check.c                    |  69 +++++++++
- src/bin/pg_upgrade/function.c                 |  46 ++++--
- src/bin/pg_upgrade/info.c                     | 135 ++++++++++++++++-
+ src/bin/pg_upgrade/check.c                    | 170 +++++++++++++
+ src/bin/pg_upgrade/controldata.c              |  39 +++
+ src/bin/pg_upgrade/function.c                 |  41 ++-
+ src/bin/pg_upgrade/info.c                     | 144 ++++++++++-
  src/bin/pg_upgrade/meson.build                |   1 +
- src/bin/pg_upgrade/pg_upgrade.c               |  74 ++++++++++
- src/bin/pg_upgrade/pg_upgrade.h               |  19 +++
- .../t/003_logical_replication_slots.pl        | 139 ++++++++++++++++++
+ src/bin/pg_upgrade/pg_upgrade.c               |  71 ++++++
+ src/bin/pg_upgrade/pg_upgrade.h               |  21 ++
+ .../t/003_logical_replication_slots.pl        | 238 ++++++++++++++++++
  src/tools/pgindent/typedefs.list              |   3 +
- 10 files changed, 544 insertions(+), 15 deletions(-)
+ 11 files changed, 786 insertions(+), 15 deletions(-)
  create mode 100644 src/bin/pg_upgrade/t/003_logical_replication_slots.pl
 
 diff --git a/doc/src/sgml/ref/pgupgrade.sgml b/doc/src/sgml/ref/pgupgrade.sgml
-index 7816b4c685..07bb46f89c 100644
+index 7816b4c685..bef107295c 100644
 --- a/doc/src/sgml/ref/pgupgrade.sgml
 +++ b/doc/src/sgml/ref/pgupgrade.sgml
 @@ -360,6 +360,71 @@ make prefix=/usr/local/pgsql.new install
@@ -122,7 +127,7 @@ index 7816b4c685..07bb46f89c 100644
         or take a file system backup as the standbys are still synchronized
 -       with the primary.)  Replication slots are not copied and must
 -       be recreated.
-+       with the primary.)  Replication slots on old standby are not copied.
++       with the primary.)  Replication slots on the old standby are not copied.
 +       Only logical slots on the primary are migrated to the new standby,
 +       and other slots must be recreated.
        </para>
@@ -143,18 +148,27 @@ index 5834513add..815d1a7ca1 100644
  top_builddir = ../../..
  include $(top_builddir)/src/Makefile.global
 diff --git a/src/bin/pg_upgrade/check.c b/src/bin/pg_upgrade/check.c
-index 56e313f562..4056b7a7a9 100644
+index 56e313f562..e303e48587 100644
 --- a/src/bin/pg_upgrade/check.c
 +++ b/src/bin/pg_upgrade/check.c
-@@ -30,6 +30,7 @@ static void check_for_jsonb_9_4_usage(ClusterInfo *cluster);
+@@ -9,6 +9,7 @@
+ 
+ #include "postgres_fe.h"
+ 
++#include "access/xlogdefs.h"
+ #include "catalog/pg_authid_d.h"
+ #include "catalog/pg_collation.h"
+ #include "fe_utils/string_utils.h"
+@@ -30,6 +31,8 @@ static void check_for_jsonb_9_4_usage(ClusterInfo *cluster);
  static void check_for_pg_role_prefix(ClusterInfo *cluster);
  static void check_for_new_tablespace_dir(void);
  static void check_for_user_defined_encoding_conversions(ClusterInfo *cluster);
 +static void check_new_cluster_logical_replication_slots(void);
++static void check_old_cluster_for_valid_slots(bool live_check);
  
  
  /*
-@@ -89,6 +90,9 @@ check_and_dump_old_cluster(bool live_check)
+@@ -89,6 +92,9 @@ check_and_dump_old_cluster(bool live_check)
  	/* Extract a list of databases and tables from the old cluster */
  	get_db_and_rel_infos(&old_cluster);
  
@@ -164,7 +178,21 @@ index 56e313f562..4056b7a7a9 100644
  	init_tablespaces();
  
  	get_loadable_libraries();
-@@ -189,6 +193,8 @@ check_new_cluster(void)
+@@ -104,6 +110,13 @@ check_and_dump_old_cluster(bool live_check)
+ 	check_for_reg_data_type_usage(&old_cluster);
+ 	check_for_isn_and_int8_passing_mismatch(&old_cluster);
+ 
++	/*
++	 * Logical replication slots can be migrated since PG17. See comments atop
++	 * get_old_cluster_logical_slot_infos().
++	 */
++	if (GET_MAJOR_VERSION(old_cluster.major_version) >= 1700)
++		check_old_cluster_for_valid_slots(live_check);
++
+ 	/*
+ 	 * PG 16 increased the size of the 'aclitem' type, which breaks the
+ 	 * on-disk format for existing data.
+@@ -189,6 +202,8 @@ check_new_cluster(void)
  {
  	get_db_and_rel_infos(&new_cluster);
  
@@ -173,7 +201,7 @@ index 56e313f562..4056b7a7a9 100644
  	check_new_cluster_is_empty();
  
  	check_loadable_libraries();
-@@ -1402,3 +1408,66 @@ check_for_user_defined_encoding_conversions(ClusterInfo *cluster)
+@@ -1402,3 +1417,158 @@ check_for_user_defined_encoding_conversions(ClusterInfo *cluster)
  	else
  		check_ok();
  }
@@ -190,6 +218,7 @@ index 56e313f562..4056b7a7a9 100644
 +	PGresult   *res;
 +	PGconn	   *conn;
 +	int			nslots = 0;
++	int			nlost_slots;
 +	int			max_replication_slots;
 +	char	   *wal_level;
 +
@@ -207,14 +236,21 @@ index 56e313f562..4056b7a7a9 100644
 +
 +	prep_status("Checking for logical replication slots");
 +
-+	res = executeQueryOrDie(conn, "SELECT slot_name "
++	res = executeQueryOrDie(conn, "SELECT count(*) "
 +							"FROM pg_catalog.pg_replication_slots "
 +							"WHERE slot_type = 'logical' AND "
 +							"temporary IS FALSE;");
 +
-+	if (PQntuples(res))
-+		pg_fatal("New cluster must not have logical replication slots but found \"%s\"",
-+				 PQgetvalue(res, 0, 0));
++	nlost_slots = atoi(PQgetvalue(res, 0, 0));
++
++	if (nlost_slots)
++	{
++		if (nlost_slots == 1)
++			pg_fatal("New cluster must not have logical replication slots but found a slot.");
++		else
++			pg_fatal("New cluster must not have logical replication slots but found %d slots",
++					nlost_slots);
++	}
 +
 +	PQclear(res);
 +
@@ -240,8 +276,142 @@ index 56e313f562..4056b7a7a9 100644
 +
 +	check_ok();
 +}
++
++/*
++ * check_old_cluster_for_valid_slots()
++ *
++ * Make sure logical replication slots can be migrated to new cluster.
++ * Following points are checked:
++ *
++ *	- All logical replication slots are usable.
++ *	- All logical replication slots consumed all WALs, except a
++ *	  CHECKPOINT_SHUTDOWN record.
++ */
++static void
++check_old_cluster_for_valid_slots(bool live_check)
++{
++	int			i,
++				ntups,
++				i_slotname;
++	PGresult   *res;
++	DbInfo	   *active_db = &old_cluster.dbarr.dbs[0];
++	PGconn	   *conn;
++
++	/* Quick exit if the cluster does not have logical slots. */
++	if (count_old_cluster_logical_slots() == 0)
++		return;
++
++	conn = connectToServer(&old_cluster, active_db->db_name);
++
++	prep_status("Checking for valid logical replication slots");
++
++	/*
++	 * We don't allow to upgrade in the presence of lost slots as we can't
++	 * migrate those.
++	 */
++	res = executeQueryOrDie(conn,
++							"SELECT slot_name FROM pg_catalog.pg_replication_slots "
++							"WHERE slot_type = 'logical' AND "
++							"wal_status = 'lost' AND "
++							"temporary IS FALSE;");
++
++	ntups = PQntuples(res);
++	i_slotname = PQfnumber(res, "slot_name");
++
++	for (i = 0; i < ntups; i++)
++		pg_log(PG_WARNING,
++			   "\nWARNING: logical replication slot \"%s\" is in 'lost' state.",
++			   PQgetvalue(res, i, i_slotname));
++
++	PQclear(res);
++
++	if (ntups)
++		pg_fatal("One or more logical replication slots with a state of 'lost' were detected.");
++
++	/*
++	 * Do additional checks to ensure that confirmed_flush LSN of all the slots
++	 * is the same as the latest checkpoint location.
++	 *
++	 * Note: This can be satisfied only when the old cluster has been shut
++	 * down, so we skip this live checks.
++	 */
++	if (!live_check)
++	{
++		res = executeQueryOrDie(conn,
++								"SELECT slot_name FROM pg_catalog.pg_replication_slots "
++								"WHERE slot_type = 'logical' AND "
++								"confirmed_flush_lsn != '%X/%X' AND temporary IS FALSE;",
++								LSN_FORMAT_ARGS(old_cluster.controldata.chkpnt_latest));
++
++		ntups = PQntuples(res);
++		i_slotname = PQfnumber(res, "slot_name");
++
++		for (i = 0; i < ntups; i++)
++			pg_log(PG_WARNING,
++				   "\nWARNING: logical replication slot \"%s\" has not consumed WALs yet",
++				   PQgetvalue(res, i, i_slotname));
++
++		PQclear(res);
++
++		if (ntups)
++			pg_fatal("One or more logical replication slots still have unconsumed WAL records.");
++	}
++
++	PQfinish(conn);
++	check_ok();
++}
+diff --git a/src/bin/pg_upgrade/controldata.c b/src/bin/pg_upgrade/controldata.c
+index 4beb65ab22..11881db84c 100644
+--- a/src/bin/pg_upgrade/controldata.c
++++ b/src/bin/pg_upgrade/controldata.c
+@@ -169,6 +169,45 @@ get_control_data(ClusterInfo *cluster, bool live_check)
+ 				}
+ 				got_cluster_state = true;
+ 			}
++
++			else if ((p = strstr(bufin, "Latest checkpoint location:")) != NULL)
++			{
++				/*
++				 * Read the latest checkpoint location if the cluster is PG17
++				 * or later. This is used for upgrading logical replication
++				 * slots. Currently, we need it only for the old cluster but
++				 * didn't add additional check for the similicity.
++				 */
++				if (GET_MAJOR_VERSION(cluster->major_version) >= 1700)
++				{
++					char	   *slash = NULL;
++					uint32		upper_lsn,
++								lower_lsn;
++
++					p = strchr(p, ':');
++
++					if (p == NULL || strlen(p) <= 1)
++						pg_fatal("%d: controldata retrieval problem", __LINE__);
++
++					p++;		/* remove ':' char */
++
++					p = strpbrk(p, "01234567890ABCDEF");
++
++					if (p == NULL || strlen(p) <= 1)
++						pg_fatal("%d: controldata retrieval problem", __LINE__);
++
++					/*
++					 * The upper and lower part of LSN must be read separately
++					 * because it is stored as in %X/%X format.
++					 */
++					upper_lsn = strtoul(p, &slash, 16);
++					lower_lsn = strtoul(++slash, NULL, 16);
++
++					/* And combine them */
++					cluster->controldata.chkpnt_latest =
++						((uint64) upper_lsn << 32) | lower_lsn;
++				}
++			}
+ 		}
+ 
+ 		rc = pclose(output);
 diff --git a/src/bin/pg_upgrade/function.c b/src/bin/pg_upgrade/function.c
-index dc8800c7cd..5b4b414a91 100644
+index dc8800c7cd..b00e6af6a9 100644
 --- a/src/bin/pg_upgrade/function.c
 +++ b/src/bin/pg_upgrade/function.c
 @@ -11,6 +11,7 @@
@@ -252,21 +422,18 @@ index dc8800c7cd..5b4b414a91 100644
  #include "pg_upgrade.h"
  
  /*
-@@ -46,7 +47,12 @@ library_name_compare(const void *p1, const void *p2)
+@@ -46,7 +47,9 @@ library_name_compare(const void *p1, const void *p2)
  /*
   * get_loadable_libraries()
   *
 - *	Fetch the names of all old libraries containing C-language functions.
-+ *	Fetch the names of all old libraries:
-+ *	1. Name of library files containing C-language functions (for non-built-in
-+ *	   functions), and
-+ *	2. Shared object (library) names containing the logical replication output
-+ *	   plugins
++ *	Fetch the names of all old libraries containing either C-language functions
++ *	or are corresponding to logical replication output plugins.
 + *
   *	We will later check that they all exist in the new installation.
   */
  void
-@@ -55,32 +61,48 @@ get_loadable_libraries(void)
+@@ -55,32 +58,46 @@ get_loadable_libraries(void)
  	PGresult  **ress;
  	int			totaltups;
  	int			dbnum;
@@ -275,7 +442,7 @@ index dc8800c7cd..5b4b414a91 100644
  	ress = (PGresult **) pg_malloc(old_cluster.dbarr.ndbs * sizeof(PGresult *));
  	totaltups = 0;
  
-+	/* Construct a query string for fetching non-built-in C functions */
++	/* distinct libraries for non-built-in C functions */
 +	appendPQExpBuffer(query, "SELECT DISTINCT probin "
 +					  "FROM pg_catalog.pg_proc "
 +					  "WHERE prolang = %u AND "
@@ -284,15 +451,13 @@ index dc8800c7cd..5b4b414a91 100644
 +					  ClanguageId,
 +					  FirstNormalObjectId);
 +
-+	/*
-+	 * If old_cluster is PG 17 or later, logical decoding output plugins must
-+	 * also be included.
-+	 */
++	/* upgrade of logical slots are supported since PG 17 */
 +	if (GET_MAJOR_VERSION(old_cluster.major_version) >= 1700)
 +		appendPQExpBufferStr(query, " UNION "
 +							 "SELECT DISTINCT plugin "
 +							 "FROM pg_catalog.pg_replication_slots "
-+							 "WHERE wal_status <> 'lost' AND "
++							 "WHERE slot_type = 'logical' AND "
++							 "wal_status <> 'lost' AND "
 +							 "database = current_database() AND "
 +							 "temporary IS FALSE;");
 +
@@ -327,7 +492,7 @@ index dc8800c7cd..5b4b414a91 100644
  	totaltups = 0;
  
 diff --git a/src/bin/pg_upgrade/info.c b/src/bin/pg_upgrade/info.c
-index aa5faca4d6..c905e02d45 100644
+index aa5faca4d6..6944b1cd41 100644
 --- a/src/bin/pg_upgrade/info.c
 +++ b/src/bin/pg_upgrade/info.c
 @@ -26,6 +26,7 @@ static void get_rel_infos(ClusterInfo *cluster, DbInfo *dbinfo);
@@ -347,7 +512,7 @@ index aa5faca4d6..c905e02d45 100644
  
  	for (tupnum = 0; tupnum < ntups; tupnum++)
  	{
-@@ -600,6 +601,116 @@ get_rel_infos(ClusterInfo *cluster, DbInfo *dbinfo)
+@@ -600,6 +601,125 @@ get_rel_infos(ClusterInfo *cluster, DbInfo *dbinfo)
  	dbinfo->rel_arr.nrels = num_rels;
  }
  
@@ -367,9 +532,16 @@ index aa5faca4d6..c905e02d45 100644
 +
 +	int			num_slots;
 +
++	/*
++	 * The temporary slots are expressly ignored while checking because such
++	 * slots cannot exist after the upgrade. During the upgrade, clusters are
++	 * started and stopped several times so that temporary slots will be
++	 * removed.
++	 */
 +	res = executeQueryOrDie(conn, "SELECT slot_name, plugin, two_phase "
 +							"FROM pg_catalog.pg_replication_slots "
-+							"WHERE wal_status <> 'lost' AND "
++							"WHERE slot_type = 'logical' AND "
++							"wal_status <> 'lost' AND "
 +							"database = current_database() AND "
 +							"temporary IS FALSE;");
 +
@@ -411,8 +583,10 @@ index aa5faca4d6..c905e02d45 100644
 + * Higher level routine to generate LogicalSlotInfoArr for all databases.
 + *
 + * Note: This function will not do anything if the old cluster is pre-PG17.
-+ * The logical slots are not saved at shutdown, and the confirmed_flush_lsn is
-+ * always behind the SHUTDOWN_CHECKPOINT record. Subsequent checks done in
++ * This is because before that the logical slots are not saved at shutdown, so
++ * there is no guarantee that the latest confirmed_flush_lsn is saved to disk
++ * which can lead to data loss. It is still not guaranteed for manually created
++ * slots in PG17, so subsequent checks done in
 + * check_old_cluster_for_valid_slots() would raise a FATAL error if such slots
 + * are included.
 + */
@@ -447,8 +621,8 @@ index aa5faca4d6..c905e02d45 100644
 + * Sum up and return the number of logical replication slots for all databases.
 + *
 + * Note: this function always returns 0 if the old_cluster is PG16 and prior
-+ * because old_cluster.dbarr.dbs[dbnum].slot_arr is set only for PG17 and
-+ * later.
++ * because we gather slot information only for cluster versions greater than or
++ * equal to PG17. See get_old_cluster_logical_slot_infos().
 + */
 +int
 +count_old_cluster_logical_slots(void)
@@ -464,7 +638,7 @@ index aa5faca4d6..c905e02d45 100644
  
  static void
  free_db_and_rel_infos(DbInfoArr *db_arr)
-@@ -610,6 +721,12 @@ free_db_and_rel_infos(DbInfoArr *db_arr)
+@@ -610,6 +730,12 @@ free_db_and_rel_infos(DbInfoArr *db_arr)
  	{
  		free_rel_infos(&db_arr->dbs[dbnum].rel_arr);
  		pg_free(db_arr->dbs[dbnum].db_name);
@@ -477,7 +651,7 @@ index aa5faca4d6..c905e02d45 100644
  	}
  	pg_free(db_arr->dbs);
  	db_arr->dbs = NULL;
-@@ -660,3 +777,19 @@ print_rel_infos(RelInfoArr *rel_arr)
+@@ -660,3 +786,19 @@ print_rel_infos(RelInfoArr *rel_arr)
  			   rel_arr->rels[relnum].reloid,
  			   rel_arr->rels[relnum].tablespace);
  }
@@ -510,7 +684,7 @@ index 12a97f84e2..228f29b688 100644
      'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow
    },
 diff --git a/src/bin/pg_upgrade/pg_upgrade.c b/src/bin/pg_upgrade/pg_upgrade.c
-index 4562dafcff..c4bf12fd6b 100644
+index 4562dafcff..b267b484b1 100644
 --- a/src/bin/pg_upgrade/pg_upgrade.c
 +++ b/src/bin/pg_upgrade/pg_upgrade.c
 @@ -59,6 +59,7 @@ static void copy_xact_xlog_xid(void);
@@ -521,14 +695,11 @@ index 4562dafcff..c4bf12fd6b 100644
  
  ClusterInfo old_cluster,
  			new_cluster;
-@@ -188,6 +189,20 @@ main(int argc, char **argv)
+@@ -188,6 +189,17 @@ main(int argc, char **argv)
  			  new_cluster.pgdata);
  	check_ok();
  
 +	/*
-+	 * Logical replication slot upgrade only supported for old_cluster >=
-+	 * PG17.
-+	 *
 +	 * Note: This must be done after doing the pg_resetwal command because
 +	 * pg_resetwal would remove required WALs.
 +	 */
@@ -542,7 +713,7 @@ index 4562dafcff..c4bf12fd6b 100644
  	if (user_opts.do_sync)
  	{
  		prep_status("Sync data directory to disk");
-@@ -860,3 +875,62 @@ set_frozenxids(bool minmxid_only)
+@@ -860,3 +872,62 @@ set_frozenxids(bool minmxid_only)
  
  	check_ok();
  }
@@ -606,10 +777,18 @@ index 4562dafcff..c4bf12fd6b 100644
 +	check_ok();
 +}
 diff --git a/src/bin/pg_upgrade/pg_upgrade.h b/src/bin/pg_upgrade/pg_upgrade.h
-index 7afa96716e..dae92ef6c0 100644
+index 7afa96716e..e72318f500 100644
 --- a/src/bin/pg_upgrade/pg_upgrade.h
 +++ b/src/bin/pg_upgrade/pg_upgrade.h
-@@ -150,6 +150,22 @@ typedef struct
+@@ -10,6 +10,7 @@
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ 
++#include "access/xlogdefs.h"
+ #include "common/relpath.h"
+ #include "libpq-fe.h"
+ 
+@@ -150,6 +151,22 @@ typedef struct
  	int			nrels;
  } RelInfoArr;
  
@@ -632,7 +811,7 @@ index 7afa96716e..dae92ef6c0 100644
  /*
   * The following structure represents a relation mapping.
   */
-@@ -176,6 +192,7 @@ typedef struct
+@@ -176,6 +193,7 @@ typedef struct
  	char		db_tablespace[MAXPGPATH];	/* database default tablespace
  											 * path */
  	RelInfoArr	rel_arr;		/* array of all user relinfos */
@@ -640,7 +819,15 @@ index 7afa96716e..dae92ef6c0 100644
  } DbInfo;
  
  /*
-@@ -400,6 +417,8 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
+@@ -225,6 +243,7 @@ typedef struct
+ 	bool		date_is_int;
+ 	bool		float8_pass_by_value;
+ 	uint32		data_checksum_version;
++	XLogRecPtr	chkpnt_latest;
+ } ControlData;
+ 
+ /*
+@@ -400,6 +419,8 @@ FileNameMap *gen_db_file_maps(DbInfo *old_db,
  							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
  							  const char *new_pgdata);
  void		get_db_and_rel_infos(ClusterInfo *cluster);
@@ -651,10 +838,10 @@ index 7afa96716e..dae92ef6c0 100644
  
 diff --git a/src/bin/pg_upgrade/t/003_logical_replication_slots.pl b/src/bin/pg_upgrade/t/003_logical_replication_slots.pl
 new file mode 100644
-index 0000000000..ae87c33708
+index 0000000000..7c6cc6d04b
 --- /dev/null
 +++ b/src/bin/pg_upgrade/t/003_logical_replication_slots.pl
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,238 @@
 +# Copyright (c) 2023, PostgreSQL Global Development Group
 +
 +# Tests for upgrading replication slots
@@ -678,6 +865,10 @@ index 0000000000..ae87c33708
 +# Initialize new cluster
 +my $new_publisher = PostgreSQL::Test::Cluster->new('new_publisher');
 +$new_publisher->init(allows_streaming => 'replica');
++
++# Initialize subscriber cluster
++my $subscriber = PostgreSQL::Test::Cluster->new('subscriber');
++$subscriber->init(allows_streaming => 'logical');
 +
 +my $bindir = $new_publisher->config_data('--bindir');
 +
@@ -722,13 +913,19 @@ index 0000000000..ae87c33708
 +$old_publisher->safe_psql('postgres',
 +	"SELECT pg_create_logical_replication_slot('test_slot2', 'test_decoding', false, true);"
 +);
++
++# 2. Consume WAL records to avoid another type of upgrade failure. It will be
++#	 tested in subsequent cases.
++$old_publisher->safe_psql('postgres',
++	"SELECT count(*) FROM pg_logical_slot_get_changes('test_slot1', NULL, NULL);"
++);
 +$old_publisher->stop;
 +
-+# 2. max_replication_slots is set to smaller than the number of slots (2)
++# 3. max_replication_slots is set to smaller than the number of slots (2)
 +#	 present on the old cluster
 +$new_publisher->append_conf('postgresql.conf', "max_replication_slots = 1");
 +
-+# 3. wal_level is set correctly on the new cluster
++# 4. wal_level is set correctly on the new cluster
 +$new_publisher->append_conf('postgresql.conf', "wal_level = 'logical'");
 +
 +# pg_upgrade will fail because the new cluster has insufficient max_replication_slots
@@ -752,7 +949,7 @@ index 0000000000..ae87c33708
 +rmtree($new_publisher->data_dir . "/pg_upgrade_output.d");
 +
 +# ------------------------------
-+# TEST: Successful upgrade
++# TEST: Confirm pg_upgrade fails when the slot still has unconsumed WAL records
 +
 +# Preparations for the subsequent test:
 +# 1. Remove the slot 'test_slot2', leaving only 1 slot remaining on the old
@@ -763,10 +960,81 @@ index 0000000000..ae87c33708
 +	"SELECT * FROM pg_drop_replication_slot('test_slot2');"
 +);
 +
-+# 2. Consume WAL records
++# 2. Generate extra WAL records. Because these WAL records do not get consumed
++#	 it will cause the upcoming pg_upgrade test to fail.
 +$old_publisher->safe_psql('postgres',
-+	"SELECT count(*) FROM pg_logical_slot_get_changes('test_slot1', NULL, NULL)"
++	"CREATE TABLE tbl AS SELECT generate_series(1, 10) AS a;"
 +);
++$old_publisher->stop;
++
++# pg_upgrade will fail because the slot still has unconsumed WAL records
++command_fails(
++	[
++		'pg_upgrade', '--no-sync',
++		'-d',         $old_publisher->data_dir,
++		'-D',         $new_publisher->data_dir,
++		'-b',         $bindir,
++		'-B',         $bindir,
++		'-s',         $new_publisher->host,
++		'-p',         $old_publisher->port,
++		'-P',         $new_publisher->port,
++		$mode,
++	],
++	'run of pg_upgrade of old cluster with idle replication slots');
++ok( -d $new_publisher->data_dir . "/pg_upgrade_output.d",
++	"pg_upgrade_output.d/ not removed after pg_upgrade failure");
++
++# Clean up
++rmtree($new_publisher->data_dir . "/pg_upgrade_output.d");
++
++# ------------------------------
++# TEST: Successful --check command
++
++# Preparations for the subsequent test:
++# 1. Start the cluster. --check works well when an old cluster is running.
++$old_publisher->start;
++
++# Actual run, successful --check command is expected
++command_ok(
++	[
++		'pg_upgrade', '--no-sync',
++		'-d',         $old_publisher->data_dir,
++		'-D',         $new_publisher->data_dir,
++		'-b',         $bindir,
++		'-B',         $bindir,
++		'-s',         $new_publisher->host,
++		'-p',         $old_publisher->port,
++		'-P',         $new_publisher->port,
++		$mode,        '--check'
++	],
++	'run of pg_upgrade --check for new instance');
++ok(!-d $new_publisher->data_dir . "/pg_upgrade_output.d",
++	"pg_upgrade_output.d/ not removed after pg_upgrade --check success");
++
++# Remove the remained slot
++$old_publisher->safe_psql('postgres',
++	"SELECT * FROM pg_drop_replication_slot('test_slot1');"
++);
++
++# ------------------------------
++# TEST: Successful upgrade
++
++# Preparations for the subsequent test:
++# 1. Setup logical replication
++my $old_connstr = $old_publisher->connstr . ' dbname=postgres';
++$old_publisher->safe_psql('postgres',
++	"CREATE PUBLICATION pub FOR ALL TABLES;"
++);
++$subscriber->start;
++$subscriber->safe_psql(
++	'postgres', qq[
++	CREATE TABLE tbl (a int);
++	CREATE SUBSCRIPTION sub CONNECTION '$old_connstr' PUBLICATION pub WITH (two_phase = 'true')
++]);
++$subscriber->wait_for_subscription_sync($old_publisher, 'sub');
++
++# 2. Temporarily disable the subscription
++$subscriber->safe_psql('postgres', "ALTER SUBSCRIPTION sub DISABLE");
 +$old_publisher->stop;
 +
 +# Actual run, successful upgrade is expected
@@ -786,12 +1054,30 @@ index 0000000000..ae87c33708
 +ok( !-d $new_publisher->data_dir . "/pg_upgrade_output.d",
 +	"pg_upgrade_output.d/ removed after pg_upgrade success");
 +
-+# Check that the slot 'test_slot1' has migrated to the new cluster
++# Check that the slot 'sub' has migrated to the new cluster
 +$new_publisher->start;
 +my $result = $new_publisher->safe_psql('postgres',
 +	"SELECT slot_name, two_phase FROM pg_replication_slots");
-+is($result, qq(test_slot1|t), 'check the slot exists on new cluster');
-+$new_publisher->stop;
++is($result, qq(sub|t), 'check the slot exists on new cluster');
++
++# Update the connection
++my $new_connstr = $new_publisher->connstr . ' dbname=postgres';
++$subscriber->safe_psql(
++	'postgres', qq[
++	ALTER SUBSCRIPTION sub CONNECTION '$new_connstr';
++	ALTER SUBSCRIPTION sub ENABLE;
++]);
++
++# Check whether changes on the new publisher get replicated to the subscriber
++$new_publisher->safe_psql('postgres',
++	"INSERT INTO tbl VALUES (generate_series(11, 20))");
++$new_publisher->wait_for_catchup('sub');
++$result = $subscriber->safe_psql('postgres', "SELECT count(*) FROM tbl");
++is($result, qq(20), 'check changes are replicated to the subscriber');
++
++# Clean up
++$subscriber->stop();
++$new_publisher->stop();
 +
 +done_testing();
 diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list

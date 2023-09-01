@@ -1,7 +1,7 @@
-From b48ccc25062984173deb25699546d688971f4f0d Mon Sep 17 00:00:00 2001
+From 7d23c302aaff6ad5034ee1ee4f668de6352d865e Mon Sep 17 00:00:00 2001
 From: Julien Rouhaud <julien.rouhaud@free.fr>
 Date: Fri, 14 Apr 2023 13:49:09 +0800
-Subject: [PATCH v28 1/3] Persist logical slots to disk during a shutdown
+Subject: [PATCH v29 1/2] Persist logical slots to disk during a shutdown
  checkpoint if required.
 
 It's entirely possible for a logical slot to have a confirmed_flush LSN
