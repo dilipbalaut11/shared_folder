@@ -1,0 +1,96 @@
+diff --git a/autotuner/Makefile b/autotuner/Makefile
+index bff9f8c..ba85828 100644
+--- a/autotuner/Makefile
++++ b/autotuner/Makefile
+@@ -17,7 +17,7 @@ DATA = autotuner--1.0.sql
+ PGFILEDESC = "PostgreSQL autotuner"
+ 
+ ifdef USE_PGXS
+-PG_CONFIG = pg_config
++PG_CONFIG = /home/dilip/work/PPAS/install/bin/pg_config
+ PGXS := $(shell $(PG_CONFIG) --pgxs)
+ include $(PGXS)
+ else
+@@ -25,4 +25,4 @@ subdir = contrib/autotuner
+ top_builddir = ../..
+ include $(top_builddir)/src/Makefile.global
+ include $(top_srcdir)/contrib/contrib-global.mk
+-endif
+\ No newline at end of file
++endif
+diff --git a/autotuner/autotuner.c b/autotuner/autotuner.c
+index 6f5b762..bccf111 100644
+--- a/autotuner/autotuner.c
++++ b/autotuner/autotuner.c
+@@ -52,6 +52,7 @@ autotunerSharedState *autotunerState;
+ HTAB	   *autotunerHash;
+ 
+ /* Saved hook values in case of unload */
++static shmem_request_hook_type prev_shmem_request_hook = NULL;
+ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+ static planner_hook_type prev_planner_hook = NULL;
+ static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+@@ -64,7 +65,7 @@ void		_PG_init(void);
+ void		_PG_fini(void);
+ 
+ static void autotuner_shmem_startup(void);
+-
++static void autotuner_shmem_request(void);
+ PlannedStmt *autotuner_Planner(Query *parse, const char *query_string,
+ 							   int cursorOptions,
+ 							   ParamListInfo boundParams);
+@@ -146,11 +147,11 @@ _PG_init(void)
+ 	 * the postmaster process.)  We'll allocate or attach to the shared
+ 	 * resources in autotuner_shmem_startup().
+ 	 */
+-	RequestAddinShmemSpace(sizeof(autotunerSharedState));
+-	RequestNamedLWLockTranche("autotuner-hash", 1);
+-	RequestNamedLWLockTranche("autotuner-test", 1);
++	//RequestAddinShmemSpace(sizeof(autotunerSharedState));
+ 
+ 	/* Install hooks. */
++	prev_shmem_request_hook = shmem_request_hook;
++	shmem_request_hook = autotuner_shmem_request;
+ 	prev_shmem_startup_hook = shmem_startup_hook;
+ 	shmem_startup_hook = autotuner_shmem_startup;
+ 	prev_planner_hook = planner_hook;
+@@ -187,6 +188,7 @@ void
+ _PG_fini(void)
+ {
+ 	/* Uninstall hooks. */
++	shmem_request_hook = prev_shmem_request_hook;
+ 	shmem_startup_hook = prev_shmem_startup_hook;
+ 	planner_hook = prev_planner_hook;
+ 	ExecutorStart_hook = prev_ExecutorStart;
+@@ -195,6 +197,23 @@ _PG_fini(void)
+ 	ExecutorEnd_hook = prev_ExecutorEnd;
+ }
+ 
++static void
++autotuner_shmem_request(void)
++{
++	Size size;
++
++	if (prev_shmem_request_hook)
++		prev_shmem_request_hook();
++
++	/* Postmaster-only initialization follows. */
++	size = MAXALIGN(sizeof(autotunerSharedState));
++	size = add_size(size, hash_estimate_size(autotuner_buffer_size, sizeof(autotunerQueryStats)));
++	//size = add_size(size, 10000); // just for poc
++	RequestAddinShmemSpace(size);
++       RequestNamedLWLockTranche("autotuner-hash", 1);
++        RequestNamedLWLockTranche("autotuner-test", 1);
++}
++
+ /*
+  * shmem_startup hook: allocate or attach to shared memory,
+  * then load any pre-existing statistics from file.
+@@ -206,7 +225,6 @@ autotuner_shmem_startup(void)
+ {
+ 	bool		found;
+ 	HASHCTL		info;
+-
+ 	if (prev_shmem_startup_hook)
+ 		prev_shmem_startup_hook();
+ 
