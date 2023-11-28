@@ -1,0 +1,1134 @@
+From ceb539b8010629e5036590f359a0a6634c192ad5 Mon Sep 17 00:00:00 2001
+From: MBeena Emerson <mbeena.emerson@gmail.com>
+Date: Thu, 16 Nov 2023 10:49:55 +0530
+Subject: [PATCH 1/2] Cleanup existing code
+
+- Remove uncessary header
+- Run pgindent
+- Make varnames more readable
+---
+ edb_pg_tuner.c | 567 +++++++++++++++++++++++++------------------------
+ 1 file changed, 292 insertions(+), 275 deletions(-)
+
+diff --git a/edb_pg_tuner.c b/edb_pg_tuner.c
+index d029415..b574b13 100644
+--- a/edb_pg_tuner.c
++++ b/edb_pg_tuner.c
+@@ -16,48 +16,45 @@
+  */
+ 
+ #include "postgres.h"
++#include "pgstat.h"
+ 
+-#include <limits.h>
+ #include <math.h>
+ #include <sys/stat.h>
+-#include <unistd.h>
+ 
+ #include "access/xlog.h"
++#include "postmaster/autovacuum.h"
++#include "postmaster/bgworker.h"
++#include "storage/ipc.h"
++#include "storage/proc.h"
++#include "tcop/tcopprot.h"
++#include "utils/builtins.h"
++
+ #if PG_VERSION_NUM < 110000
+ #include "access/xlog_internal.h"
++#include "storage/spin.h"
+ #endif
+-#if PG_VERSION_NUM >= 150000
+-#include "catalog/objectaccess.h"
+-#include "catalog/pg_parameter_acl.h"
+-#include "funcapi.h"
+-#endif
+-#include "catalog/pg_type.h"
+-#include "miscadmin.h"
+-#include "nodes/execnodes.h"
++
+ #if PG_VERSION_NUM >= 120000
+ #include "optimizer/optimizer.h"
+ #else
+ #include "optimizer/cost.h"
+ #endif
+-#include "postmaster/autovacuum.h"
+-#include "postmaster/bgworker.h"
++
+ #if PG_VERSION_NUM >= 130000
+ #include "postmaster/interrupt.h"
+-#endif
+-#include "storage/fd.h"
+-#include "storage/ipc.h"
+-#include "storage/proc.h"
+-#if PG_VERSION_NUM < 110000
+-#include "storage/spin.h"
++#else
++#include "catalog/pg_type.h"
++#include "miscadmin.h"
+ #endif
+ 
+-#include "tcop/tcopprot.h"
+-#include "utils/builtins.h"
+-#if PG_VERSION_NUM >= 140000
+-#include "utils/wait_event.h"
+-#endif
+ 
+-#include "pgstat.h"
++#if PG_VERSION_NUM >= 150000
++#include "catalog/objectaccess.h"
++#include "catalog/pg_parameter_acl.h"
++#include "funcapi.h"
++#else
++#include "nodes/execnodes.h"
++#endif
+ 
+ #ifdef PGT_FREEBSD
+ #include <sys/types.h>
+@@ -96,13 +93,14 @@ typedef enum
+ 
+ /* memory information. */
+ #define	PROCMEMINFO	"/proc/meminfo"
+-static uint64	totalmem;
+-static uint64	cachemem;
++static uint64 totalmem;
++static uint64 cachemem;
++
++/* edb_pg_tuner GUC variables. */
++static bool pgtuner_autotune = false;	/* auto-apply tuning recommendations? */
++static int	pgtuner_naptime;	/* probe interval */
++static int	pgtuner_max_wal_size_limit = 0; /* max_wal_size ceiling value */
+ 
+-/* edb_pg_tuner variables. */
+-static bool	autotune = false;	/* automatically apply tuning recommendations? */
+-static int	naptime;			/* probe interval */
+-static int	max_wal_size_limit = 0;	/* max_wal_size ceiling value (0 means no limit) */
+ 
+ /*
+  * GUC structures.
+@@ -130,18 +128,18 @@ struct pgt_guc
+ };
+ 
+ /* edb_pg_tuner static variables */
+-char	*on_value = "on";
+-char	*off_value = "off";
+-char	*cct_value = "0.9";
+-char	*spc_value = "1.0";
++char	   *on_value = "on";
++char	   *off_value = "off";
++char	   *cct_value = "0.9";
++char	   *spc_value = "1.0";
+ 
+ /* edb_pg_tuner dynamic variables */
+-char	*ecs_value = NULL;
+-char	*sb_value = NULL;
+-char	*mwm_value = NULL;
+-char	*mws_value = NULL;
++char	   *ecs_value = NULL;
++char	   *sb_value = NULL;
++char	   *mwm_value = NULL;
++char	   *mws_value = NULL;
+ 
+-uint64	sb_bytes = 0;
++uint64		sb_bytes = 0;
+ 
+ /*
+  * Maximum percentage difference to recommend an effective_cache_size change.
+@@ -204,7 +202,7 @@ static struct pgt_guc TunableGUCs[] =
+ 	{PGT_STATIC, PGT_GUC_BOOL, "track_activities", &on_value},
+ 	{PGT_STATIC, PGT_GUC_BOOL, "track_counts", &on_value},
+ 	{PGT_STATIC, PGT_GUC_BOOL, "zero_damaged_pages", &off_value},
+-	{0, 0, NULL, NULL}		/* end-of-list marker */
++	{0, 0, NULL, NULL}			/* end-of-list marker */
+ };
+ 
+ /*
+@@ -217,8 +215,9 @@ static struct pgt_guc TunableGUCs[] =
+  */
+ typedef struct pgtunerSharedState
+ {
+-	slock_t		mutex;				/* protect the following fields: */
++	slock_t		stateMutex;		/* protects following fields only: */
+ 	bool		modify[PGT_NUM_GUCS];
++
+ 	/* dynamic GUCs below: */
+ 	char		maintenance_work_mem[PGT_INT_LEN];
+ 	char		max_wal_size[PGT_INT_LEN];
+@@ -226,7 +225,8 @@ typedef struct pgtunerSharedState
+ 	char		effective_cache_size[PGT_INT_LEN];
+ } pgtunerSharedState;
+ 
+-static pgtunerSharedState *atss = NULL;
++/* Link to shared memory state */
++static pgtunerSharedState *pgtunerState = NULL;
+ 
+ /* XXX Saved hook values in case of unload? */
+ #if PG_VERSION_NUM >= 150000
+@@ -244,26 +244,28 @@ struct guc_max_wal_size
+ 	int64		req_ckpt;		/* # of requested checkpoints */
+ };
+ 
+-static struct guc_max_wal_size	initial_mws_state;
++static struct guc_max_wal_size initial_mws_state;
+ 
+ /* Functions declarations. */
+ extern PGDLLEXPORT Datum edb_pg_tuner_recommendations(PG_FUNCTION_ARGS);
+ 
+ PG_FUNCTION_INFO_V1(edb_pg_tuner_recommendations);
+ 
+-void _PG_init(void);
+-void PGDLLEXPORT edb_pg_tuner_main(Datum main_arg);
++void		_PG_init(void);
++void		_PG_fini(void);
++void		PGDLLEXPORT edb_pg_tuner_main(Datum main_arg);
++
+ #if PG_VERSION_NUM >= 150000
+ static void edb_pg_tuner_shmem_request(void);
+ #endif
+ static void edb_pg_tuner_shmem_startup(void);
+ 
+-static int guc_name_compare(const char *namea, const char *nameb);
++static int	guc_name_compare(const char *namea, const char *nameb);
+ static void write_auto_conf_file(int fd, const char *filename, ConfigVariable *head);
+ static void replace_auto_config_value(ConfigVariable **head_p, ConfigVariable **tail_p,
+-						  const char *name, const char *value);
++									  const char *name, const char *value);
+ 
+-static void	check_static_settings(void);
++static void check_static_settings(void);
+ static void apply_recommended_settings(void);
+ static bool is_guc_changed(int i, const char *setting);
+ 
+@@ -281,12 +283,12 @@ static void check_max_wal_size(void);
+ void
+ _PG_init(void)
+ {
+-	BackgroundWorker	worker;
++	BackgroundWorker worker;
+ 
+ 	DefineCustomBoolVariable("edb_pg_tuner.autotune",
+ 							 "Automatically apply tuning advices.",
+ 							 NULL,
+-							 &autotune,
++							 &pgtuner_autotune,
+ 							 false,
+ 							 PGC_SIGHUP,
+ 							 0,
+@@ -295,22 +297,22 @@ _PG_init(void)
+ 							 NULL);
+ 
+ 	DefineCustomIntVariable("edb_pg_tuner.naptime",
+-							 "Duration between each check (in seconds).",
+-							 NULL,
+-							 &naptime,
+-							 600,
+-							 1,
+-							 INT_MAX,
+-							 PGC_SIGHUP,
+-							 GUC_UNIT_S,
+-							 NULL,
+-							 NULL,
+-							 NULL);
++							"Duration between each check (in seconds).",
++							NULL,
++							&pgtuner_naptime,
++							600,
++							1,
++							INT_MAX,
++							PGC_SIGHUP,
++							GUC_UNIT_S,
++							NULL,
++							NULL,
++							NULL);
+ 
+ 	DefineCustomIntVariable("edb_pg_tuner.max_wal_size_limit",
+ 							"Maximum value for max_wal_size.",
+ 							NULL,
+-							&max_wal_size_limit,
++							&pgtuner_max_wal_size_limit,
+ 							0,
+ 							0,
+ 							MAX_KILOBYTES,
+@@ -344,9 +346,8 @@ _PG_init(void)
+ 
+ 	memset(&worker, 0, sizeof(BackgroundWorker));
+ 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+-			BGWORKER_BACKEND_DATABASE_CONNECTION;
++		BGWORKER_BACKEND_DATABASE_CONNECTION;
+ 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+-	//worker.bgw_restart_time = BGW_DEFAULT_RESTART_INTERVAL;	/* default is 1min */
+ 	snprintf(worker.bgw_library_name, BGW_MAXLEN, "edb_pg_tuner");
+ 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "edb_pg_tuner_main");
+ 	snprintf(worker.bgw_name, BGW_MAXLEN, "tuning worker");
+@@ -358,49 +359,19 @@ _PG_init(void)
+ 	RegisterBackgroundWorker(&worker);
+ }
+ 
++
+ /*
+- * Request extra shared memory for use by this module. It should be called via
+- * shmem_request_hook that will be loaded into the postmaster via
+- * shared_preload_libraries.
+- *
+- * See commit 4f2400cb3f1.
++ * Module unload callback
+  */
+-#if PG_VERSION_NUM >= 150000
+-static void
+-edb_pg_tuner_shmem_request(void)
++void
++_PG_fini(void)
+ {
+-	uint64	base;
+-	char	*str;
+-
+-	if (prev_shmem_request_hook)
+-		prev_shmem_request_hook();
+-
+-	RequestAddinShmemSpace(MAXALIGN(sizeof(pgtunerSharedState)));
+-
+-	/*
+-	 * All GUCs that cannot be modified without a restart (context is
+-	 * postmaster) should be set here. Hence, GUC settings are defined *before*
+-	 * creating shared memory. The main advantage is that no restart is
+-	 * required. It only applies these new GUC settings if autotune parameter
+-	 * is enabled.
+-	 * The hook that calls this function is only available for Postgres 15+. If
+-	 * you are using a prior Postgres version, it sets the new recommendation
+-	 * but it takes effect only after you restart the service.
+-	 */
+-	if (autotune)
+-	{
+-		/* shared buffers */
+-		base = get_shared_buffers();
+-		str = get_pretty_size(base);
+-
+-		SetConfigOption("shared_buffers", str,
+-						PGC_POSTMASTER, PGC_S_OVERRIDE);
+-		elog(DEBUG1, "edb_pg_tuner: before creating shared memory: shared_buffers = %d", NBuffers);
+-
+-		pfree(str);
+-	}
+-}
++	/* Uninstall hooks. */
++#if PG_VERSION_NUM >= 150000
++	shmem_request_hook = prev_shmem_request_hook;
+ #endif
++	shmem_startup_hook = prev_shmem_startup_hook;
++}
+ 
+ /*
+  * This module allocates its shared memory and provides initial state here.
+@@ -414,34 +385,37 @@ edb_pg_tuner_shmem_startup(void)
+ 		prev_shmem_startup_hook();
+ 
+ 	/* reset in case this is a restart within the postmaster */
+-	atss = NULL;
++	pgtunerState = NULL;
+ 
+ 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+-	atss = ShmemInitStruct("edb_pg_tuner", sizeof(pgtunerSharedState), &found);
++	pgtunerState = ShmemInitStruct("edb_pg_tuner", sizeof(pgtunerSharedState), &found);
+ 
+ 	if (!found)
+ 	{
+-		SpinLockInit(&atss->mutex);
++		SpinLockInit(&pgtunerState->stateMutex);
+ 		for (int i = 0; i < PGT_NUM_GUCS; i++)
+-			atss->modify[i] = false;
+-		memset(atss->shared_buffers, 0, PGT_INT_LEN);
+-		memset(atss->max_wal_size, 0, PGT_INT_LEN);
++			pgtunerState->modify[i] = false;
++		memset(pgtunerState->shared_buffers, 0, PGT_INT_LEN);
++		memset(pgtunerState->max_wal_size, 0, PGT_INT_LEN);
++
+ 		/*
+ 		 * Keep local pointers to the shared memory structure. They will be
+ 		 * useful for backends that call edb_pg_tuner_recommendations().
+ 		 */
+ 		if (ecs_value == NULL)
+-			ecs_value = (char *)&atss->effective_cache_size[0];
++			ecs_value = (char *) &pgtunerState->effective_cache_size[0];
+ 		if (sb_value == NULL)
+-			sb_value = (char *)&atss->shared_buffers[0];
++			sb_value = (char *) &pgtunerState->shared_buffers[0];
+ 		if (mws_value == NULL)
+-			mws_value = (char *)&atss->max_wal_size[0];
++			mws_value = (char *) &pgtunerState->max_wal_size[0];
+ 		if (mwm_value == NULL)
+-			mwm_value = (char *)&atss->maintenance_work_mem[0];
++			mwm_value = (char *) &pgtunerState->maintenance_work_mem[0];
+ 	}
+ 	LWLockRelease(AddinShmemInitLock);
+ }
+ 
++
++/* Background worker function */
+ void
+ edb_pg_tuner_main(Datum main_arg)
+ {
+@@ -454,13 +428,7 @@ edb_pg_tuner_main(Datum main_arg)
+ 	pqsignal(SIGTERM, die);
+ 	BackgroundWorkerUnblockSignals();
+ 
+-	/*
+-	 * Establish a database connection.
+-	 *
+-	 * XXX Do we need to access a non-shared catalog? If so, we need to connect
+-	 * to a database (postgres?) or even add a new custom GUC to use a database
+-	 * provided by the user.
+-	 */
++	/* Establish a database connection. */
+ #if PG_VERSION_NUM >= 110000
+ 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+ #else
+@@ -483,12 +451,12 @@ edb_pg_tuner_main(Datum main_arg)
+ 	{
+ 		(void) WaitLatch(MyLatch,
+ #if PG_VERSION_NUM >= 120000
+-							   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+ #else
+-							   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
++						 WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+ #endif
+-							   naptime * 1000L,
+-							   PG_WAIT_EXTENSION);
++						 pgtuner_naptime * 1000L,
++						 PG_WAIT_EXTENSION);
+ 		ResetLatch(MyLatch);
+ 
+ 		CHECK_FOR_INTERRUPTS();
+@@ -522,7 +490,7 @@ edb_pg_tuner_main(Datum main_arg)
+ 			 * reason. Hence, let's be flexible and allow the use of this
+ 			 * extension in these scenarios too.
+ 			 */
+-			if (autotune)
++			if (pgtuner_autotune)
+ 				apply_recommended_settings();
+ 		}
+ 
+@@ -717,23 +685,21 @@ write_auto_conf_file(int fd, const char *filename, ConfigVariable *head)
+ static void
+ apply_recommended_settings(void)
+ {
+-	const char		*name;
+-	char			*value;
+-	ConfigVariable	*head = NULL;
+-	ConfigVariable	*tail = NULL;
+-	volatile int	Tmpfd;
+-	char			AutoConfFileName[MAXPGPATH];
+-	char			AutoConfTmpFileName[MAXPGPATH];
+-	struct stat		st;
+-	bool			do_reload = false;
+-	bool			do_nothing = true;
+-
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
+-
+-	/*
+-	 * Are there any modifications to apply?
+-	 */
+-	SpinLockAcquire(&s->mutex);
++	const char *name;
++	char	   *value;
++	char		AutoConfFileName[MAXPGPATH];
++	char		AutoConfTmpFileName[MAXPGPATH];
++	struct stat st;
++	bool		do_reload = false;
++	bool		do_nothing = true;
++	volatile int Tmpfd;
++	ConfigVariable *head = NULL;
++	ConfigVariable *tail = NULL;
++
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
++
++	/* Are there any modifications to apply? */
++	SpinLockAcquire(&s->stateMutex);
+ 	for (int i = 0; TunableGUCs[i].name; i++)
+ 	{
+ 		if (s->modify[i])
+@@ -742,7 +708,7 @@ apply_recommended_settings(void)
+ 			break;
+ 		}
+ 	}
+-	SpinLockRelease(&s->mutex);
++	SpinLockRelease(&s->stateMutex);
+ 	if (do_nothing)
+ 		return;
+ 
+@@ -794,12 +760,12 @@ apply_recommended_settings(void)
+ 	 */
+ 	for (int i = 0; TunableGUCs[i].name; i++)
+ 	{
+-		bool	modify;
++		bool		modify;
+ 
+-		SpinLockAcquire(&s->mutex);
++		SpinLockAcquire(&s->stateMutex);
+ 		modify = s->modify[i];
+ 		s->modify[i] = false;	/* modification will be done in the next step. */
+-		SpinLockRelease(&s->mutex);
++		SpinLockRelease(&s->stateMutex);
+ 
+ 		if (modify)
+ 		{
+@@ -808,16 +774,16 @@ apply_recommended_settings(void)
+ 
+ 			if (TunableGUCs[i].type == PGT_GUC_STRING)
+ 				elog(DEBUG1, "edb_pg_tuner: apply recommended setting: %s = '%s'",
+-							name, value);
++					 name, value);
+ 			else
+ 				elog(DEBUG1, "edb_pg_tuner: apply recommended setting: %s = %s",
+-							name, value);
++					 name, value);
+ 
+ 			do_reload = true;	/* reload service? */
+ 
+ 			/*
+-			 * Replace any existing entry with the recommended value, or add it
+-			 * if not present.
++			 * Replace any existing entry with the recommended value, or add
++			 * it if not present.
+ 			 */
+ 			replace_auto_config_value(&head, &tail, name, value);
+ 
+@@ -903,8 +869,8 @@ apply_recommended_settings(void)
+ 	/*
+ 	 * Reload the service (to re-read the configuration settings), if it
+ 	 * modifies at least one GUC. It could check if the GUC requires a reload,
+-	 * however, it is a one-time change and it should check the GUC context. It
+-	 * seems it isn't worth it.
++	 * however, it is a one-time change and it should check the GUC context.
++	 * It seems it isn't worth it.
+ 	 */
+ 	if (do_reload)
+ 	{
+@@ -926,16 +892,16 @@ static bool
+ is_guc_changed(int i, const char *setting)
+ {
+ 	if (TunableGUCs[i].type == PGT_GUC_BOOL &&
+-			strcmp(*TunableGUCs[i].recommended, setting) == 0)
++		strcmp(*TunableGUCs[i].recommended, setting) == 0)
+ 		return false;
+ 	if (TunableGUCs[i].type == PGT_GUC_INT &&
+-			strtol(*TunableGUCs[i].recommended, NULL, 10) == strtol(setting, NULL, 10))
++		strtol(*TunableGUCs[i].recommended, NULL, 10) == strtol(setting, NULL, 10))
+ 		return false;
+ 	if (TunableGUCs[i].type == PGT_GUC_REAL &&
+-			strtod(*TunableGUCs[i].recommended, NULL) == strtod(setting, NULL))
++		strtod(*TunableGUCs[i].recommended, NULL) == strtod(setting, NULL))
+ 		return false;
+ 	if (TunableGUCs[i].type == PGT_GUC_STRING &&
+-			strcmp(*TunableGUCs[i].recommended, setting) == 0)
++		strcmp(*TunableGUCs[i].recommended, setting) == 0)
+ 		return false;
+ 
+ 	return true;
+@@ -949,11 +915,11 @@ is_guc_changed(int i, const char *setting)
+ static void
+ check_static_settings(void)
+ {
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
+ 
+ 	for (int i = 0; TunableGUCs[i].name; i++)
+ 	{
+-		char *setting;
++		char	   *setting;
+ 
+ 		/* check only static settings. */
+ 		if (TunableGUCs[i].category != PGT_STATIC)
+@@ -967,31 +933,31 @@ check_static_settings(void)
+ 		 * eventually be dynamically set).
+ 		 */
+ 		if (setting == NULL || *TunableGUCs[i].recommended == NULL)
+-				continue;
++			continue;
+ 
+ 		elog(DEBUG3, "edb_pg_tuner: static setting: %s: current: %s ; recommended: %s",
+-					TunableGUCs[i].name, setting, *TunableGUCs[i].recommended);
++			 TunableGUCs[i].name, setting, *TunableGUCs[i].recommended);
+ 
+ 		/*
+ 		 * Is the current setting different from the recommendation?
+ 		 */
+-		SpinLockAcquire(&s->mutex);
++		SpinLockAcquire(&s->stateMutex);
+ 		if (is_guc_changed(i, setting))
+ 			s->modify[i] = true;
+ 		else
+ 			s->modify[i] = false;
+-		SpinLockRelease(&s->mutex);
++		SpinLockRelease(&s->stateMutex);
+ 
+ 		if (s->modify[i])
+ 		{
+ 			if (TunableGUCs[i].type == PGT_GUC_STRING)
+ 				elog(DEBUG1, "edb_pg_tuner: new setting: %s = '%s'",
+-							TunableGUCs[i].name,
+-							*TunableGUCs[i].recommended);
++					 TunableGUCs[i].name,
++					 *TunableGUCs[i].recommended);
+ 			else
+ 				elog(DEBUG1, "edb_pg_tuner: new setting: %s = %s",
+-							TunableGUCs[i].name,
+-							*TunableGUCs[i].recommended);
++					 TunableGUCs[i].name,
++					 *TunableGUCs[i].recommended);
+ 		}
+ 	}
+ }
+@@ -1011,9 +977,9 @@ static void
+ get_memory_information(void)
+ {
+ #ifdef	PGT_LINUX
+-	FILE	*fd;
+-	char	str[100];
+-	int		count = 0;
++	FILE	   *fd;
++	char		str[100];
++	int			count = 0;
+ 
+ 	/* invalid size. */
+ 	totalmem = 0;
+@@ -1041,7 +1007,7 @@ get_memory_information(void)
+ 	{
+ 		if (strncmp(str, "MemTotal", 8) == 0)
+ 		{
+-			uint64	res;
++			uint64		res;
+ 
+ 			if (sscanf(str, "%*s " UINT64_FORMAT, &res) == 1)
+ 				totalmem = res * 1024;	/* kB -> bytes */
+@@ -1052,7 +1018,7 @@ get_memory_information(void)
+ 		}
+ 		else if (strncmp(str, "Cached", 6) == 0)
+ 		{
+-			uint64	res;
++			uint64		res;
+ 
+ 			if (sscanf(str, "%*s " UINT64_FORMAT, &res) == 1)
+ 				cachemem = res * 1024;	/* kB -> bytes */
+@@ -1071,7 +1037,7 @@ get_memory_information(void)
+ #endif	/* PGT_LINUX */
+ 
+ #ifdef	PGT_WINDOWS
+-	MEMORYSTATUSEX	stat;
++	MEMORYSTATUSEX stat;
+ 
+ 	/* invalid size */
+ 	totalmem = 0;
+@@ -1086,9 +1052,9 @@ get_memory_information(void)
+ #endif	/* PGT_WINDOWS */
+ 
+ #ifdef	PGT_FREEBSD
+-	int64_t	res;
+-	size_t	len;
+-	int		mib[2] = {CTL_HW, HW_PHYSMEM};
++	int64_t		res;
++	size_t		len;
++	int			mib[2] = {CTL_HW, HW_PHYSMEM};
+ 
+ 	/* invalid size */
+ 	totalmem = 0;
+@@ -1124,16 +1090,17 @@ get_memory_information(void)
+ static uint64
+ get_shared_buffers(void)
+ {
+-	uint64	base;
++	uint64		base;
+ 
+-	base = totalmem / 4;	/* start with 25% RAM. */
++	base = totalmem / 4;		/* start with 25% RAM. */
+ 
+ 	if (totalmem < PGT_MEM_3_GB)
+-		base *= 0.5;		/* change to 12.5% RAM. */
++		base *= 0.5;			/* change to 12.5% RAM. */
+ 	else if (totalmem < PGT_MEM_8_GB)
+-		base *= 0.75;		/* change to 18.75% RAM. */
++		base *= 0.75;			/* change to 18.75% RAM. */
+ 	else if (totalmem > PGT_MEM_64_GB)
+-		base = max_value(totalmem / 6, PGT_MEM_16_GB);	/* change to 16.67% RAM or 16 GB. */
++		base = max_value(totalmem / 6, PGT_MEM_16_GB);	/* change to 16.67% RAM
++														 * or 16 GB. */
+ 
+ 	/*
+ 	 * Change up to 64 GB. Use the nearest integer.
+@@ -1154,7 +1121,7 @@ get_shared_buffers(void)
+ static char *
+ get_pretty_size(int64 s)
+ {
+-	Datum res;
++	Datum		res;
+ 
+ 	res = DirectFunctionCall1(pg_size_pretty, Int64GetDatum(s));
+ 
+@@ -1167,16 +1134,16 @@ get_pretty_size(int64 s)
+ static void
+ check_shared_buffers(void)
+ {
+-	uint64	base;
+-	char	*str;
++	uint64		base;
++	char	   *str;
+ 
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
+ 
+ 	base = get_shared_buffers();
+ 
+ 	/*
+-	 * Since shared_buffers is marked as PGT_GUC_STRING, no quotes are required
+-	 * here; it will be added by edb_pg_tuner_recommendations().
++	 * Since shared_buffers is marked as PGT_GUC_STRING, no quotes are
++	 * required here; it will be added by edb_pg_tuner_recommendations().
+ 	 *
+ 	 * Store shared buffers recommendation into sb_bytes. It will be used to
+ 	 * calculate effective_cache_size. s->shared_buffers (aka sb_value) is not
+@@ -1184,21 +1151,21 @@ check_shared_buffers(void)
+ 	 */
+ 	sb_bytes = base;
+ 	str = get_pretty_size(sb_bytes);
+-	SpinLockAcquire(&s->mutex);
+-	strlcpy((char *)&s->shared_buffers, str, PGT_INT_LEN);
+-	SpinLockRelease(&s->mutex);
++	SpinLockAcquire(&s->stateMutex);
++	strlcpy((char *) &s->shared_buffers, str, PGT_INT_LEN);
++	SpinLockRelease(&s->stateMutex);
+ 	pfree(str);
+ 
+ 	elog(DEBUG1, "edb_pg_tuner: new shared buffers recommendation: %s (%.2f%% of RAM)",
+-					sb_value, (sb_bytes * 100.0) / totalmem);
++		 sb_value, (sb_bytes * 100.0) / totalmem);
+ 
+ 	for (int i = 0; i < PGT_NUM_GUCS; i++)
+ 	{
+ 		if (strcmp(TunableGUCs[i].name, "shared_buffers") == 0)
+ 		{
+-			SpinLockAcquire(&s->mutex);
++			SpinLockAcquire(&s->stateMutex);
+ 			s->modify[i] = true;
+-			SpinLockRelease(&s->mutex);
++			SpinLockRelease(&s->stateMutex);
+ 			break;
+ 		}
+ 	}
+@@ -1207,11 +1174,11 @@ check_shared_buffers(void)
+ static void
+ check_effective_cache_size(void)
+ {
+-	uint64	base;
+-	char	*str;
+-	double	threshold;
++	uint64		base;
++	char	   *str;
++	double		threshold;
+ 
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
+ 
+ 	/*
+ 	 * Postgres defines effective_cache_size as "the number of disk pages in
+@@ -1234,7 +1201,7 @@ check_effective_cache_size(void)
+ 	 */
+ 	threshold = ((base * 100.0) / ((double) effective_cache_size * BLCKSZ)) - 100.0;
+ 	elog(DEBUG3, "edb_pg_tuner: effective_cache_size: memory: " UINT64_FORMAT " ; current: %d ; threshold: %.2f%%",
+-			base, effective_cache_size, threshold);
++		 base, effective_cache_size, threshold);
+ 	if (threshold >= (-1.0 * PGT_CACHE_SIZE_PERC) && threshold <= PGT_CACHE_SIZE_PERC)
+ 	{
+ 		elog(DEBUG2, "edb_pg_tuner: effective_cache_size: difference is less than or equal to %.2f%%; ignore it", threshold);
+@@ -1242,21 +1209,21 @@ check_effective_cache_size(void)
+ 	}
+ 
+ 	str = get_pretty_size(base);
+-	SpinLockAcquire(&s->mutex);
+-	strlcpy((char *)&s->effective_cache_size, str, PGT_INT_LEN);
+-	SpinLockRelease(&s->mutex);
++	SpinLockAcquire(&s->stateMutex);
++	strlcpy((char *) &s->effective_cache_size, str, PGT_INT_LEN);
++	SpinLockRelease(&s->stateMutex);
+ 	pfree(str);
+ 
+ 	elog(DEBUG1, "edb_pg_tuner: new effective_cache_size recommendation: %s (%.2f%% of RAM)",
+-					ecs_value, (base * 100.0) / totalmem);
++		 ecs_value, (base * 100.0) / totalmem);
+ 
+ 	for (int i = 0; i < PGT_NUM_GUCS; i++)
+ 	{
+ 		if (strcmp(TunableGUCs[i].name, "effective_cache_size") == 0)
+ 		{
+-			SpinLockAcquire(&s->mutex);
++			SpinLockAcquire(&s->stateMutex);
+ 			s->modify[i] = true;
+-			SpinLockRelease(&s->mutex);
++			SpinLockRelease(&s->stateMutex);
+ 			break;
+ 		}
+ 	}
+@@ -1321,17 +1288,17 @@ check_effective_cache_size(void)
+ static void
+ check_maintenance_work_mem(void)
+ {
+-	uint64	base;
+-	char	*str;
++	uint64		base;
++	char	   *str;
+ 
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
+ 
+-	base = totalmem / 5;	/* start with 20% RAM. */
++	base = totalmem / 5;		/* start with 20% RAM. */
+ 
+ 	/*
+ 	 * maintenance_work_mem is per session. Divide the available memory by the
+-	 * number of autovacuum workers. It doesn't take into account the number of
+-	 * concurrent manual VACUUM sessions but we expect the majority of the
++	 * number of autovacuum workers. It doesn't take into account the number
++	 * of concurrent manual VACUUM sessions but we expect the majority of the
+ 	 * maintenance routines to be done by autovacuum.
+ 	 */
+ 	base /= autovacuum_max_workers;
+@@ -1350,21 +1317,21 @@ check_maintenance_work_mem(void)
+ 		return;
+ 
+ 	str = get_pretty_size(base);
+-	SpinLockAcquire(&s->mutex);
+-	strlcpy((char *)&s->maintenance_work_mem, str, PGT_INT_LEN);
+-	SpinLockRelease(&s->mutex);
++	SpinLockAcquire(&s->stateMutex);
++	strlcpy((char *) &s->maintenance_work_mem, str, PGT_INT_LEN);
++	SpinLockRelease(&s->stateMutex);
+ 	pfree(str);
+ 
+ 	elog(DEBUG1, "edb_pg_tuner: new maintenance_work_mem recommendation: %s (%.2f%% of RAM)",
+-					mwm_value, (base * 100.0) / totalmem);
++		 mwm_value, (base * 100.0) / totalmem);
+ 
+ 	for (int i = 0; i < PGT_NUM_GUCS; i++)
+ 	{
+ 		if (strcmp(TunableGUCs[i].name, "maintenance_work_mem") == 0)
+ 		{
+-			SpinLockAcquire(&s->mutex);
++			SpinLockAcquire(&s->stateMutex);
+ 			s->modify[i] = true;
+-			SpinLockRelease(&s->mutex);
++			SpinLockRelease(&s->stateMutex);
+ 			break;
+ 		}
+ 	}
+@@ -1378,29 +1345,33 @@ check_maintenance_work_mem(void)
+ static void
+ get_max_wal_size_state(struct guc_max_wal_size *g)
+ {
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
+-	char	*str;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
++	char	   *str;
+ 
+ 	g->lsn = GetXLogWriteRecPtr();
+-#if PG_VERSION_NUM >= 150000
++
++#if PG_VERSION_NUM >= 170000
++	g->timed_ckpt = pgstat_fetch_stat_checkpointer()->num_timed;
++	g->req_ckpt = pgstat_fetch_stat_checkpointer()->num_requested;
++#elif PG_VERSION_NUM >= 150000
+ 	g->timed_ckpt = pgstat_fetch_stat_checkpointer()->timed_checkpoints;
+ 	g->req_ckpt = pgstat_fetch_stat_checkpointer()->requested_checkpoints;
+ #else
+-	g->timed_ckpt =  pgstat_fetch_global()->timed_checkpoints;
+-	g->req_ckpt =  pgstat_fetch_global()->requested_checkpoints;
++	g->timed_ckpt = pgstat_fetch_global()->timed_checkpoints;
++	g->req_ckpt = pgstat_fetch_global()->requested_checkpoints;
+ #endif
+ 
+ 	/* Make sure any stats snapshot is thrown away */
+ 	pgstat_clear_snapshot();
+ 
+ 	str = psprintf("%dMB", max_wal_size_mb);
+-	SpinLockAcquire(&s->mutex);
+-	strlcpy((char *)&s->max_wal_size, str, PGT_INT_LEN);
+-	SpinLockRelease(&s->mutex);
++	SpinLockAcquire(&s->stateMutex);
++	strlcpy((char *) &s->max_wal_size, str, PGT_INT_LEN);
++	SpinLockRelease(&s->stateMutex);
+ 	pfree(str);
+ 
+ 	elog(DEBUG3, "edb_pg_tuner: max_wal_size: timed (%ld) ; req (%ld) ; LSN (%ld)",
+-					g->timed_ckpt, g->req_ckpt, g->lsn);
++		 g->timed_ckpt, g->req_ckpt, g->lsn);
+ 	elog(DEBUG1, "edb_pg_tuner: max_wal_size: %s", mws_value);
+ }
+ 
+@@ -1413,12 +1384,12 @@ get_max_wal_size_state(struct guc_max_wal_size *g)
+ static void
+ check_max_wal_size(void)
+ {
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
+-	float	perc_req;
+-	int		new_value;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
++	float		perc_req;
++	int			new_value;
+ 
+-	struct guc_max_wal_size	curr_mws_state;
+-	struct guc_max_wal_size	delta;
++	struct guc_max_wal_size curr_mws_state;
++	struct guc_max_wal_size delta;
+ 
+ 	/* Get current state. */
+ 	get_max_wal_size_state(&curr_mws_state);
+@@ -1429,11 +1400,11 @@ check_max_wal_size(void)
+ 	delta.req_ckpt = curr_mws_state.req_ckpt - initial_mws_state.req_ckpt;
+ 
+ 	elog(DEBUG3, "edb_pg_tuner: timed checkpoints: current (%ld) ; previous (%ld)",
+-					curr_mws_state.timed_ckpt, initial_mws_state.timed_ckpt);
++		 curr_mws_state.timed_ckpt, initial_mws_state.timed_ckpt);
+ 	elog(DEBUG3, "edb_pg_tuner: requested checkpoints: current (%ld) ; previous (%ld)",
+-					curr_mws_state.req_ckpt, initial_mws_state.req_ckpt);
++		 curr_mws_state.req_ckpt, initial_mws_state.req_ckpt);
+ 	elog(DEBUG3, "edb_pg_tuner: LSN: current (%ld) ; previous (%ld)",
+-					curr_mws_state.lsn, initial_mws_state.lsn);
++		 curr_mws_state.lsn, initial_mws_state.lsn);
+ 
+ 	/* No checkpoints, bail out. */
+ 	if (delta.timed_ckpt <= 0 && delta.req_ckpt <= 0)
+@@ -1446,7 +1417,7 @@ check_max_wal_size(void)
+ 	perc_req = (delta.req_ckpt * 100) / (delta.req_ckpt + delta.timed_ckpt);
+ 
+ 	elog(DEBUG1, "edb_pg_tuner: checkpoints: requested (%ld) and timed (%ld) ; perc (%.2f%%)",
+-			delta.timed_ckpt, delta.req_ckpt, perc_req);
++		 delta.timed_ckpt, delta.req_ckpt, perc_req);
+ 
+ 	/*
+ 	 * Check if a new setting for max_wal_size is required. Checkpoints are
+@@ -1461,15 +1432,15 @@ check_max_wal_size(void)
+ 	 * additional amount is an attempt to avoid another modification in the
+ 	 * next round. (Average is not a good metric for this case but since we
+ 	 * don't gather information during every checkpoint, it is an easy and
+-	 * cheap way to adjust this parameter.) If max_wal_size_limit is set, don't
++	 * cheap way to adjust this parameter.) If pgtuner_max_wal_size_limit is set, don't
+ 	 * set max_wal_size greater than this value.
+ 	 */
+ 	if (perc_req >= PGT_REQ_CKPT_PERC)
+ 	{
+ #if PG_VERSION_NUM >= 110000
+-		int wss_in_mb = wal_segment_size / (1024 * 1024);
++		int			wss_in_mb = wal_segment_size / (1024 * 1024);
+ #else
+-		int wss_in_mb = XLogSegSize / (1024 * 1024);
++		int			wss_in_mb = XLogSegSize / (1024 * 1024);
+ #endif
+ 
+ 		/* unit is in MB */
+@@ -1477,34 +1448,34 @@ check_max_wal_size(void)
+ 		new_value *= (1 + PGT_REQ_CKPT_PERC);
+ 
+ 		/* limit max_wal_size value */
+-		if (max_wal_size_limit > 0 && new_value > max_wal_size_limit)
+-			new_value = max_wal_size_limit;
++		if (pgtuner_max_wal_size_limit > 0 && new_value > pgtuner_max_wal_size_limit)
++			new_value = pgtuner_max_wal_size_limit;
+ 
+ 		/* max_wal_size must be at least twice wal_segment_size */
+ 		if ((new_value / wss_in_mb) < 2)
+ 			new_value = 2 * wss_in_mb;
+ 
+-		/* let's increase if the suggested value is greater than the current one. */
++		/* increase if the suggested value is greater than the current one. */
+ 		if (new_value > max_wal_size_mb)
+ 		{
+-			char	*str;
++			char	   *str;
+ 
+ 			str = psprintf("%dMB", new_value);
+-			SpinLockAcquire(&s->mutex);
+-			strlcpy((char *)s->max_wal_size, str, PGT_INT_LEN);
+-			SpinLockRelease(&s->mutex);
++			SpinLockAcquire(&s->stateMutex);
++			strlcpy((char *) s->max_wal_size, str, PGT_INT_LEN);
++			SpinLockRelease(&s->stateMutex);
+ 			pfree(str);
+ 
+ 			elog(DEBUG1, "edb_pg_tuner: new max_wal_size recommendation: %s (current is %dMB)",
+-							mws_value, max_wal_size_mb);
++				 mws_value, max_wal_size_mb);
+ 
+ 			for (int i = 0; i < PGT_NUM_GUCS; i++)
+ 			{
+ 				if (strcmp(TunableGUCs[i].name, "max_wal_size") == 0)
+ 				{
+-					SpinLockAcquire(&s->mutex);
++					SpinLockAcquire(&s->stateMutex);
+ 					s->modify[i] = true;
+-					SpinLockRelease(&s->mutex);
++					SpinLockRelease(&s->stateMutex);
+ 					break;
+ 				}
+ 			}
+@@ -1515,32 +1486,33 @@ check_max_wal_size(void)
+ Datum
+ edb_pg_tuner_recommendations(PG_FUNCTION_ARGS)
+ {
+-	volatile pgtunerSharedState *s = (volatile pgtunerSharedState *) atss;
+-	ReturnSetInfo	*rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+-	StringInfoData	buf;
+-	PgTunerFormat	format;
++	volatile	pgtunerSharedState *s = (volatile pgtunerSharedState *) pgtunerState;
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	StringInfoData buf;
++	PgTunerFormat format;
+ 
+-	TupleDesc		tupdesc;
+-	Tuplestorestate	*tupstore;
++	TupleDesc	tupdesc;
++	Tuplestorestate *tupstore;
+ #if PG_VERSION_NUM < 150000
+-	bool			randomaccess;
+-	MemoryContext	per_query_ctx;
+-	MemoryContext	old_context;
++	bool		randomaccess;
++	MemoryContext per_query_ctx;
++	MemoryContext old_context;
+ #endif
+ 
+ 	/*
+-	 * First time that this backend calls edb_pg_tuner_recommendations(), assign
+-	 * the shared memory pointers to these variables.  TunableGUCs points to
+-	 * these variables that should point to the exact members in shared memory.
++	 * First time that this backend calls edb_pg_tuner_recommendations(),
++	 * assign the shared memory pointers to these variables.  TunableGUCs
++	 * points to these variables that should point to the exact members in
++	 * shared memory.
+ 	 */
+ 	if (ecs_value == NULL)
+-		ecs_value = (char *)&s->effective_cache_size[0];
++		ecs_value = (char *) &s->effective_cache_size[0];
+ 	if (sb_value == NULL)
+-		sb_value = (char *)&s->shared_buffers[0];
++		sb_value = (char *) &s->shared_buffers[0];
+ 	if (mws_value == NULL)
+-		mws_value = (char *)&s->max_wal_size[0];
++		mws_value = (char *) &s->max_wal_size[0];
+ 	if (mwm_value == NULL)
+-		mwm_value = (char *)&s->maintenance_work_mem[0];
++		mwm_value = (char *) &s->maintenance_work_mem[0];
+ 
+ 	/* Sanity checks. */
+ 	if (PG_ARGISNULL(0))
+@@ -1548,6 +1520,7 @@ edb_pg_tuner_recommendations(PG_FUNCTION_ARGS)
+ 	else
+ 	{
+ 		const char *format_str = text_to_cstring(PG_GETARG_TEXT_PP(0));
++
+ 		if (strcmp(format_str, "sql") == 0)
+ 			format = PGT_FORMAT_SQL;
+ 		else if (strcmp(format_str, "conf") == 0)
+@@ -1607,11 +1580,11 @@ edb_pg_tuner_recommendations(PG_FUNCTION_ARGS)
+ 
+ 	for (int i = 0; TunableGUCs[i].name; i++)
+ 	{
+-		bool	modify;
++		bool		modify;
+ 
+-		SpinLockAcquire(&s->mutex);
++		SpinLockAcquire(&s->stateMutex);
+ 		modify = s->modify[i];
+-		SpinLockRelease(&s->mutex);
++		SpinLockRelease(&s->stateMutex);
+ 
+ 		/* Ignore a dynamic GUC until a recommendation is set. */
+ 		if (TunableGUCs[i].category == PGT_DYNAMIC && *TunableGUCs[i].recommended[0] == '\0')
+@@ -1622,30 +1595,30 @@ edb_pg_tuner_recommendations(PG_FUNCTION_ARGS)
+ 
+ 		if (modify)
+ 		{
+-			Datum	values[1];
+-			bool	nulls[1];
++			Datum		values[1];
++			bool		nulls[1];
+ 
+ 			if (format == PGT_FORMAT_KEYVALUE)
+ 			{
+ 				if (TunableGUCs[i].type == PGT_GUC_STRING)
+ 					appendStringInfo(&buf, "%s = '%s'",
+-								TunableGUCs[i].name,
+-								*TunableGUCs[i].recommended);
++									 TunableGUCs[i].name,
++									 *TunableGUCs[i].recommended);
+ 				else
+ 					appendStringInfo(&buf, "%s = %s",
+-								TunableGUCs[i].name,
+-								*TunableGUCs[i].recommended);
++									 TunableGUCs[i].name,
++									 *TunableGUCs[i].recommended);
+ 			}
+ 			else if (format == PGT_FORMAT_SQL)
+ 			{
+ 				if (TunableGUCs[i].type == PGT_GUC_STRING)
+ 					appendStringInfo(&buf, "ALTER SYSTEM SET %s = '%s';",
+-								TunableGUCs[i].name,
+-								*TunableGUCs[i].recommended);
++									 TunableGUCs[i].name,
++									 *TunableGUCs[i].recommended);
+ 				else
+ 					appendStringInfo(&buf, "ALTER SYSTEM SET %s = %s;",
+-								TunableGUCs[i].name,
+-								*TunableGUCs[i].recommended);
++									 TunableGUCs[i].name,
++									 *TunableGUCs[i].recommended);
+ 			}
+ 			/* no need for an error here (see a sanity check above) */
+ 
+@@ -1659,3 +1632,47 @@ edb_pg_tuner_recommendations(PG_FUNCTION_ARGS)
+ 
+ 	return (Datum) 0;
+ }
++
++#if PG_VERSION_NUM >= 150000
++/*
++ * Request extra shared memory for use by this module. It should be called via
++ * shmem_request_hook that will be loaded into the postmaster via
++ * shared_preload_libraries.
++ *
++ * See commit 4f2400cb3f1.
++ */
++static void
++edb_pg_tuner_shmem_request(void)
++{
++	uint64		base;
++	char	   *str;
++
++	if (prev_shmem_request_hook)
++		prev_shmem_request_hook();
++
++	RequestAddinShmemSpace(MAXALIGN(sizeof(pgtunerSharedState)));
++
++	/*
++	 * All GUCs that cannot be modified without a restart (context is
++	 * postmaster) should be set here. Hence, GUC settings are defined *before*
++	 * creating shared memory. The main advantage is that no restart is
++	 * required. It only applies these new GUC settings if pgtuner_autotune parameter
++	 * is enabled.
++	 * The hook that calls this function is only available for Postgres 15+. If
++	 * you are using a prior Postgres version, it sets the new recommendation
++	 * but it takes effect only after you restart the service.
++	 */
++	if (pgtuner_autotune)
++	{
++		/* shared buffers */
++		base = get_shared_buffers();
++		str = get_pretty_size(base);
++
++		SetConfigOption("shared_buffers", str,
++						PGC_POSTMASTER, PGC_S_OVERRIDE);
++		elog(DEBUG1, "edb_pg_tuner: before creating shared memory: shared_buffers = %d", NBuffers);
++
++		pfree(str);
++	}
++}
++#endif
+-- 
+2.34.1
+

@@ -1,0 +1,856 @@
+From 49b937c7d8b4e6dcfa7f54f6d9693943d3e5d58f Mon Sep 17 00:00:00 2001
+From: MBeena Emerson <mbeena.emerson@gmail.com>
+Date: Thu, 16 Nov 2023 10:53:35 +0530
+Subject: [PATCH 2/2] Add code to auto tune workmem
+
+Supported from v14 onwards. Store query stats in a hash table and when we re run
+the query, check for disk psilli n previous execution and bump up the work_mem
+for this particular querybefore execution. This avoids disk spill and increases
+performanace of the query.
+
+Bumping of work mem: We maintain a pool size and a particular query can only use
+maximum 25% of this pool for the query. If the required memory is not available
+in the pool or the required memory is over the limit allocated tehn the memory
+will not be bumped and execution will continue as is.
+
+Logging and auto tuning : We have gucs to set the logging and auto tuning. We
+can set either or both off. When logging is enabled, the stats of query
+executed are logged. When autotuning is on, the work_mem will be adjusted as
+required for the queries that are logged.
+---
+ edb_pg_tuner.c | 749 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 748 insertions(+), 1 deletion(-)
+
+diff --git a/edb_pg_tuner.c b/edb_pg_tuner.c
+index b574b13..9114bba 100644
+--- a/edb_pg_tuner.c
++++ b/edb_pg_tuner.c
+@@ -47,6 +47,16 @@
+ #include "miscadmin.h"
+ #endif
+ 
++#if PG_VERSION_NUM == 140000
++#include "executor/execdesc.h"
++#include "executor/executor.h"
++#endif
++
++#if PG_VERSION_NUM >= 140000
++#include "access/parallel.h"
++#include "optimizer/planner.h"
++#include "storage/lwlock.h"
++#endif
+ 
+ #if PG_VERSION_NUM >= 150000
+ #include "catalog/objectaccess.h"
+@@ -56,6 +66,12 @@
+ #include "nodes/execnodes.h"
+ #endif
+ 
++#if PG_VERSION_NUM >= 160000
++#include "nodes/queryjumble.h"
++#elif PG_VERSION_NUM >= 140000
++#include "utils/queryjumble.h"
++#endif
++
+ #ifdef PGT_FREEBSD
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+@@ -218,6 +234,16 @@ typedef struct pgtunerSharedState
+ 	slock_t		stateMutex;		/* protects following fields only: */
+ 	bool		modify[PGT_NUM_GUCS];
+ 
++#if PG_VERSION_NUM >= 140000
++	/* auto-tune work mem data */
++	LWLock	   *hashLock;		/* protects hash table search/modification */
++	TimestampTz stats_reset;	/* timestamp with all stats reset */
++	int64		total_queries;	/* total number of queries processed */
++	int32		unique_queries; /* number of unique queries in the hash table */
++	int64		deallocs;		/* number of queries de-allocated */
++	int32		pool_used;		/* amount of work_mem_pool used */
++#endif
++
+ 	/* dynamic GUCs below: */
+ 	char		maintenance_work_mem[PGT_INT_LEN];
+ 	char		max_wal_size[PGT_INT_LEN];
+@@ -246,6 +272,94 @@ struct guc_max_wal_size
+ 
+ static struct guc_max_wal_size initial_mws_state;
+ 
++
++/* Declare all objects required to auto tune work_mem supported from v14 */
++#if PG_VERSION_NUM >= 140000
++/*
++ * Magic Numbers
++ *
++ * SORT_WORK_MEM_MULTIPLIER is an approximation of the amount of work_mem that is
++ * required to replace a disk sort of a given size. It's difficult (impossible?)
++ * to calculate this accurately on the fly where we need to, so we use a simple
++ * multiplier instead.
++ *
++ * HASH_WORK_MEM_MULTIPLIER is an approximation of the amount of work_mem that is
++ * required to prevent a hash agg spilling to disk. It's difficult (impossible?)
++ * to calculate this accurately on the fly where we need to, so we use a simple
++ * multiplier instead.
++ *
++ * MAX_POOL_PER_QUERY is the fraction of the pool size that we allow to be
++ * allocated as work_mem to any individual query.
++ */
++#define SORT_WORK_MEM_MULTIPLIER 1.75
++#define HASH_WORK_MEM_MULTIPLIER 5.0
++#define MAX_POOL_PER_QUERY 0.25
++
++#define greater_of(x, y) ((x) >= (y) ? (x) : (y))
++
++/* GUC variables */
++static bool pgtuner_tune_work_mem;	/* enable/disable work_mem tuning */
++static int	pgtuner_work_mem_pool;	/* size of work_mem pool */
++static int	pgtuner_log_min_duration;	/* msec or -1 */
++static int	pgtuner_buffer_size;
++
++/* Standard work_mem */
++static int	prev_work_mem = -1;
++
++/* Hash Table */
++HTAB	   *pgtunerHash;
++
++/* Current nesting depth of ExecutorRun calls */
++static int	nesting_level = 0;
++
++/* Is the current top-level query to be sampled? */
++static bool current_query_sampled = false;
++
++#define logging_enabled() \
++    (pgtuner_log_min_duration >= 0 && \
++     nesting_level == 0 && \
++     current_query_sampled)
++
++/*
++ * Stats for a single query
++ */
++typedef struct pgtunerQueryStats
++{
++	uint64		query_id;		/* hash key of entry - MUST BE FIRST */
++	int64		executed;		/* the number of executions for this query */
++	int64		sort_spill;		/* the max sort spill to disk for this query */
++	int32		sort_nodes;		/* the max sort nodes in this query */
++	int64		hash_spill;		/* the max hashagg spill to disk in this query */
++	int32		hash_nodes;		/* the max hashagg nodes in this query */
++} pgtunerQueryStats;
++
++/* hooks */
++static planner_hook_type prev_planner_hook = NULL;
++static ExecutorStart_hook_type prev_ExecutorStart = NULL;
++static ExecutorRun_hook_type prev_ExecutorRun = NULL;
++static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
++static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
++
++static PlannedStmt *pgtuner_Planner(Query *parse, const char *query_string,
++									int cursorOptions,
++									ParamListInfo boundParams);
++static void pgtuner_ExecutorStart(QueryDesc *queryDesc, int eflags);
++static void pgtuner_ExecutorRun(QueryDesc *queryDesc,
++								ScanDirection direction,
++								uint64 count, bool execute_once);
++static void pgtuner_ExecutorFinish(QueryDesc *queryDesc);
++static void pgtuner_ExecutorEnd(QueryDesc *queryDesc);
++static void planner_hook_work_mem(Query *parse, const char *query_string, int cursorOptions,
++								  ParamListInfo boundParams);
++static void executor_end_hook_work_mem(QueryDesc *queryDesc);
++
++static int	entry_cmp(const void *lhs, const void *rhs);
++static void update_global_stats(void);
++static bool entry_dealloc(int desired_work_mem);
++static int	get_work_mem(int sort_spill, int hash_spill);
++static void get_work_mem_stats(PlanState *plan, pgtunerQueryStats * stats);
++#endif
++
+ /* Functions declarations. */
+ extern PGDLLEXPORT Datum edb_pg_tuner_recommendations(PG_FUNCTION_ARGS);
+ 
+@@ -322,6 +436,76 @@ _PG_init(void)
+ 							NULL,
+ 							NULL);
+ 
++#if PG_VERSION_NUM >= 140000
++	DefineCustomIntVariable("edb_pg_tuner.work_mem_pool",
++							"Sets size of the memory pool available for "
++							"allocating to work_mem",
++							"This is the maximum amount of memory that will be "
++							"available in total for allocation to adjusted "
++							"work_mem. Note that more than this may actually "
++							"be used as a single query may perform multiple "
++							"sorts.",
++							&pgtuner_work_mem_pool,
++							2097152,	/* 2 GiB */
++							4096,
++							MAX_KILOBYTES,
++							PGC_SUSET,
++							GUC_UNIT_KB,
++							NULL,
++							NULL,
++							NULL);
++
++	DefineCustomBoolVariable("edb_pg_tuner.tune_work_mem",
++							 "Enable/disable dynamic work_mem tuning.",
++							 NULL,
++							 &pgtuner_tune_work_mem,
++							 true,
++							 PGC_SUSET,
++							 0,
++							 NULL,
++							 NULL,
++							 NULL);
++
++	DefineCustomIntVariable("edb_pg_tuner.log_min_duration",
++							"Sets the minimum execution time above which "
++							"pg_tuner stats will be logged.",
++							"Zero logs all stats. -1 turns this feature off.",
++							&pgtuner_log_min_duration,
++							0,
++							-1, INT_MAX,
++							PGC_SUSET,
++							GUC_UNIT_MS,
++							NULL,
++							NULL,
++							NULL);
++
++	DefineCustomIntVariable("edb_pg_tuner.buffer_size",
++							"Sets the maximum number of queries to track "
++							"statistics for.",
++							"This should be large enough to accommodate all "
++							"unique query IDs.",
++							&pgtuner_buffer_size,
++							5000,
++							100,
++							INT_MAX,
++							PGC_POSTMASTER,
++							0,
++							NULL,
++							NULL,
++							NULL);
++
++	prev_planner_hook = planner_hook;
++	planner_hook = pgtuner_Planner;
++	prev_ExecutorStart = ExecutorStart_hook;
++	ExecutorStart_hook = pgtuner_ExecutorStart;
++	prev_ExecutorRun = ExecutorRun_hook;
++	ExecutorRun_hook = pgtuner_ExecutorRun;
++	prev_ExecutorFinish = ExecutorFinish_hook;
++	ExecutorFinish_hook = pgtuner_ExecutorFinish;
++	prev_ExecutorEnd = ExecutorEnd_hook;
++	ExecutorEnd_hook = pgtuner_ExecutorEnd;
++#endif
++
+ #if PG_VERSION_NUM >= 150000
+ 	MarkGUCPrefixReserved("edb_pg_tuner");
+ #else
+@@ -334,13 +518,20 @@ _PG_init(void)
+ 	 */
+ 	get_memory_information();
+ 
++#if PG_VERSION_NUM >= 140000
++	/* Inform the postmaster that we want to enable query_id calculation. */
++	EnableQueryId();
++#endif
++
+ 	/* Install hooks. */
+ #if PG_VERSION_NUM >= 150000
+ 	prev_shmem_request_hook = shmem_request_hook;
+ 	shmem_request_hook = edb_pg_tuner_shmem_request;
+-#else
++#elif PG_VERSION_NUM == 140000
++	RequestNamedLWLockTranche("pgtuner-hash", 1);
+ 	RequestAddinShmemSpace(MAXALIGN(sizeof(pgtunerSharedState)));
+ #endif
++
+ 	prev_shmem_startup_hook = shmem_startup_hook;
+ 	shmem_startup_hook = edb_pg_tuner_shmem_startup;
+ 
+@@ -370,6 +561,15 @@ _PG_fini(void)
+ #if PG_VERSION_NUM >= 150000
+ 	shmem_request_hook = prev_shmem_request_hook;
+ #endif
++
++#if PG_VERSION_NUM >= 140000
++	planner_hook = prev_planner_hook;
++	ExecutorStart_hook = prev_ExecutorStart;
++	ExecutorRun_hook = prev_ExecutorRun;
++	ExecutorFinish_hook = prev_ExecutorFinish;
++	ExecutorEnd_hook = prev_ExecutorEnd;
++#endif
++
+ 	shmem_startup_hook = prev_shmem_startup_hook;
+ }
+ 
+@@ -380,6 +580,9 @@ static void
+ edb_pg_tuner_shmem_startup(void)
+ {
+ 	bool		found;
++#if PG_VERSION_NUM >= 140000
++	HASHCTL		info;
++#endif
+ 
+ 	if (prev_shmem_startup_hook)
+ 		prev_shmem_startup_hook();
+@@ -410,7 +613,29 @@ edb_pg_tuner_shmem_startup(void)
+ 			mws_value = (char *) &pgtunerState->max_wal_size[0];
+ 		if (mwm_value == NULL)
+ 			mwm_value = (char *) &pgtunerState->maintenance_work_mem[0];
++
++#if PG_VERSION_NUM >= 140000
++		/* First time through ... */
++		pgtunerState->hashLock = &(GetNamedLWLockTranche("pgtuner-hash"))->lock;
++		SpinLockInit(&pgtunerState->stateMutex);
++		pgtunerState->stats_reset = GetCurrentTimestamp();
++		pgtunerState->total_queries = 0;
++		pgtunerState->unique_queries = 0;
++		pgtunerState->deallocs = 0;
++		pgtunerState->pool_used = 0;
++#endif
+ 	}
++
++#if PG_VERSION_NUM >= 140000
++	info.keysize = sizeof(uint64);	/* uint64 for the query ID */
++	info.entrysize = sizeof(pgtunerQueryStats);
++	pgtunerHash = ShmemInitHash("pgtuner hash",
++								pgtuner_buffer_size,
++								pgtuner_buffer_size,
++								&info,
++								HASH_ELEM | HASH_BLOBS);
++#endif
++
+ 	LWLockRelease(AddinShmemInitLock);
+ }
+ 
+@@ -1645,6 +1870,7 @@ static void
+ edb_pg_tuner_shmem_request(void)
+ {
+ 	uint64		base;
++	Size		size;
+ 	char	   *str;
+ 
+ 	if (prev_shmem_request_hook)
+@@ -1674,5 +1900,520 @@ edb_pg_tuner_shmem_request(void)
+ 
+ 		pfree(str);
+ 	}
++
++	/* Postmaster-only initialization follows. */
++	size = MAXALIGN(sizeof(pgtunerSharedState));
++	size = add_size(size, hash_estimate_size(pgtuner_buffer_size, sizeof(pgtunerQueryStats)));
++	RequestAddinShmemSpace(size);
++	RequestNamedLWLockTranche("pgtuner-hash", 1);
++	RequestAddinShmemSpace(MAXALIGN(sizeof(pgtunerSharedState)));
++}
++#endif
++
++/*
++ * Define all necessary functions required for tuning work_mem supported from
++ * v14 onwards.
++ */
++#if PG_VERSION_NUM >= 140000
++/*
++ * Planner hook
++ *
++ * Check if the stats are available for the query and depending on the hash
++ * table entry bump the work_mem if possible.
++ */
++static void
++planner_hook_work_mem(Query *parse, const char *query_string, int cursorOptions,
++					  ParamListInfo boundParams)
++{
++	pgtunerQueryStats *entry;
++	bool		found = false;
++
++	/* Bail out if dynamic work_mem tuning is disabled */
++	if (!pgtuner_tune_work_mem)
++		return;
++
++	/* Check to see if this query has run before */
++	LWLockAcquire(pgtunerState->hashLock, LW_SHARED);
++
++	entry = (pgtunerQueryStats *) hash_search(pgtunerHash,
++											  &parse->queryId,
++											  HASH_FIND, &found);
++
++	/* Bump work_mem if we find an entry, and the query previously spilled */
++	prev_work_mem = -1;
++	if (found)
++	{
++		/*
++		 * We're only actually going to bump the work_mem if all of the
++		 * following hold true: - query_id != 0 (compute_query_id is not off).
++		 * - The desired work_mem is greater than the default work_mem.
++		 * - There is enough space left in the pool.
++		 * - The new work_mem won't be greater than MAX_POOL_PER_QUERY times
++		 *   the total pool.
++		 */
++		int			desired_work_mem;
++
++		desired_work_mem = get_work_mem(entry->sort_spill, entry->hash_spill);
++
++		if (parse->queryId != 0 && desired_work_mem > work_mem)
++		{
++			SpinLockAcquire(&pgtunerState->stateMutex);
++			if (desired_work_mem > pgtuner_work_mem_pool *
++				MAX_POOL_PER_QUERY)
++			{
++				elog(DEBUG1, "adjust desired_work_mem size %u to %f",
++					 desired_work_mem, (pgtuner_work_mem_pool * MAX_POOL_PER_QUERY));
++				desired_work_mem = pgtuner_work_mem_pool * MAX_POOL_PER_QUERY;
++			}
++
++			if (desired_work_mem <= pgtuner_work_mem_pool -
++				pgtunerState->pool_used)
++			{
++				ereport(DEBUG1,
++						(errmsg("query: %lu, bumping work_mem from %i KiB to "
++								"%i KiB based on disk spill %lu KiB",
++								parse->queryId, work_mem,
++								desired_work_mem,
++								greater_of(entry->sort_spill,
++										   entry->hash_spill)),
++						 errhidestmt(true)));
++				prev_work_mem = work_mem;
++				work_mem = desired_work_mem;
++
++				pgtunerState->pool_used += desired_work_mem;
++			}
++
++			SpinLockRelease(&pgtunerState->stateMutex);
++		}
++	}
++
++	LWLockRelease(pgtunerState->hashLock);
++}
++
++/*
++ * ExecutorEnd hook
++ *
++ * Reset work mem and adjust pool size and log the query stats
++ */
++static void
++executor_end_hook_work_mem(QueryDesc *queryDesc)
++{
++	double		msec;
++	pgtunerQueryStats *stats;
++	bool		found;
++	bool		skip = false;
++	int			desired_work_mem;
++
++	/* Reset work_mem, and put the memory back in the pool */
++	if (pgtuner_tune_work_mem && prev_work_mem != -1)
++	{
++		ereport(DEBUG1,
++				(errmsg("query: %lu, reset work_mem from %i KiB to %i KiB",
++						queryDesc->plannedstmt->queryId, work_mem,
++						prev_work_mem)));
++		SpinLockAcquire(&pgtunerState->stateMutex);
++		pgtunerState->pool_used -= work_mem;
++		SpinLockRelease(&pgtunerState->stateMutex);
++		work_mem = prev_work_mem;
++	}
++
++	if (logging_enabled())
++	{
++
++		/* Get the stats! */
++		stats = palloc(sizeof(pgtunerQueryStats));
++		stats->sort_spill = 0;
++		stats->sort_nodes = 0;
++		stats->hash_spill = 0;
++		stats->hash_nodes = 0;
++		get_work_mem_stats(queryDesc->planstate, stats);
++
++		/*
++		 * Log plan if duration is exceeded, and the desired work_mem for this
++		 * query is something we would actually allocate.
++		 */
++		desired_work_mem = get_work_mem(stats->sort_spill,
++										stats->hash_spill);
++
++		msec = queryDesc->totaltime->total * 1000.0;
++
++		if (msec >= pgtuner_log_min_duration)
++		{
++			ereport(DEBUG1, (errmsg("query: %lu, duration: %.3f ms, disk "
++									"spill: %lu KiB",
++									queryDesc->plannedstmt->queryId, msec,
++									stats->sort_spill), errhidestmt(true)));
++
++			LWLockAcquire(pgtunerState->hashLock, LW_EXCLUSIVE);
++
++			/* Lookup the hash table entry. */
++			if (hash_get_num_entries(pgtunerHash) >= pgtuner_buffer_size)
++			{
++				/* Deallocate on the basis of the work_mem we would need */
++				skip = !entry_dealloc(desired_work_mem);
++			}
++
++			/* Don't log anything, if nothing was deallocated (and needed it) */
++			if (!skip)
++			{
++				pgtunerQueryStats *entry = (pgtunerQueryStats *)
++				hash_search(pgtunerHash,
++							&queryDesc->plannedstmt->queryId,
++							HASH_ENTER, &found);
++
++				if (!found)
++				{
++					entry->executed = 1;
++					entry->sort_spill = stats->sort_spill;
++					entry->sort_nodes = stats->sort_nodes;
++					entry->hash_spill = stats->hash_spill;
++					entry->hash_nodes = stats->hash_nodes;
++				}
++				else
++				{
++					entry->executed++;
++					entry->sort_spill = greater_of(entry->sort_spill,
++												   stats->sort_spill);
++					entry->sort_nodes = greater_of(entry->sort_nodes,
++												   stats->sort_nodes);
++					entry->hash_spill = greater_of(entry->hash_spill,
++												   stats->hash_spill);
++					entry->hash_nodes = greater_of(entry->hash_nodes,
++												   stats->hash_nodes);
++				}
++			}
++
++			LWLockRelease(pgtunerState->hashLock);
++		}
++	}
++}
++
++/*
++ * Planner hook: Modify the query environment if required
++ */
++static PlannedStmt *
++pgtuner_Planner(Query *parse, const char *query_string, int cursorOptions,
++				ParamListInfo boundParams)
++{
++	/* Call planner hook code in sub-modules */
++	planner_hook_work_mem(parse, query_string, cursorOptions, boundParams);
++
++	/* Resume normal operations */
++	if (prev_planner_hook)
++		return prev_planner_hook(parse, query_string,
++								 cursorOptions, boundParams);
++	else
++		return standard_planner(parse, query_string,
++								cursorOptions, boundParams);
++}
++
++/*
++ * ExecutorStart hook: start up logging if needed
++ */
++static void
++pgtuner_ExecutorStart(QueryDesc *queryDesc, int eflags)
++{
++	/*
++	 * Record stats only for top level statements, that exceed the minimum
++	 * duration.
++	 */
++	if (nesting_level == 0)
++	{
++		if (pgtuner_log_min_duration >= 0 && !IsParallelWorker())
++			current_query_sampled = true;
++		else
++			current_query_sampled = false;
++	}
++
++	if (logging_enabled())
++	{
++		/* Enable per-node instrumentation iff log_analyze is required. */
++		if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
++			queryDesc->instrument_options |= INSTRUMENT_ROWS;
++	}
++
++	if (prev_ExecutorStart)
++		prev_ExecutorStart(queryDesc, eflags);
++	else
++		standard_ExecutorStart(queryDesc, eflags);
++
++	if (logging_enabled())
++	{
++		/*
++		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
++		 * space is allocated in the per-query context so it will go away at
++		 * ExecutorEnd.
++		 */
++		if (queryDesc->totaltime == NULL)
++		{
++			MemoryContext oldcxt;
++
++			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
++			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL, false);
++			MemoryContextSwitchTo(oldcxt);
++		}
++	}
++}
++
++/*
++ * ExecutorRun hook: all we need do is track nesting depth
++ */
++static void
++pgtuner_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
++					uint64 count, bool execute_once)
++{
++	nesting_level++;
++	PG_TRY();
++	{
++		if (prev_ExecutorRun)
++			prev_ExecutorRun(queryDesc, direction, count, execute_once);
++		else
++			standard_ExecutorRun(queryDesc, direction, count, execute_once);
++	}
++	PG_FINALLY();
++	{
++		nesting_level--;
++	}
++	PG_END_TRY();
++}
++
++/*
++ * ExecutorFinish hook: all we need do is track nesting depth
++ */
++static void
++pgtuner_ExecutorFinish(QueryDesc *queryDesc)
++{
++	nesting_level++;
++	PG_TRY();
++	{
++		if (prev_ExecutorFinish)
++			prev_ExecutorFinish(queryDesc);
++		else
++			standard_ExecutorFinish(queryDesc);
++	}
++	PG_FINALLY();
++	{
++		nesting_level--;
++	}
++	PG_END_TRY();
++}
++
++/*
++ * ExecutorEnd hook: log results if needed and call executor_end_hook_work_mem
++ */
++static void
++pgtuner_ExecutorEnd(QueryDesc *queryDesc)
++{
++	MemoryContext oldcxt;
++
++	/*
++	 * Make sure we operate in the per-query context, so any cruft will be
++	 * discarded later during ExecutorEnd.
++	 */
++	oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
++
++	/*
++	 * Make sure stats accumulation is done.  (Note: it's okay if several
++	 * levels of hook all do this.)
++	 */
++	if (logging_enabled() && queryDesc->totaltime &&
++		queryDesc->plannedstmt->queryId != 0)
++		InstrEndLoop(queryDesc->totaltime);
++
++	executor_end_hook_work_mem(queryDesc);
++
++	MemoryContextSwitchTo(oldcxt);
++
++	/* Record the query processing */
++	update_global_stats();
++
++	if (prev_ExecutorEnd)
++		prev_ExecutorEnd(queryDesc);
++	else
++		standard_ExecutorEnd(queryDesc);
++}
++
++/* Calculate the amount of work_mem required, given sort and hash spills */
++static int
++get_work_mem(int sort_spill, int hash_spill)
++{
++	return ceil(greater_of(sort_spill * SORT_WORK_MEM_MULTIPLIER,
++						   hash_spill * HASH_WORK_MEM_MULTIPLIER));
++}
++
++static void
++get_work_mem_stats(PlanState *plan, pgtunerQueryStats * stats)
++{
++	if (plan->type == T_SortState)
++	{
++		int64		spill = 0;
++		SortState  *sortstate;
++		Tuplesortstate *tsstate;
++		TuplesortInstrumentation nstats;
++		TuplesortInstrumentation *wstats;
++
++		/* Count this node */
++		stats->sort_nodes = stats->sort_nodes + 1;
++
++		sortstate = castNode(SortState, plan);
++		tsstate = (Tuplesortstate *) sortstate->tuplesortstate;
++
++		/* tsstate can be NULL. Only get stats if that's not the case */
++		if (tsstate)
++		{
++			tuplesort_get_stats(tsstate, &nstats);
++
++			if (nstats.spaceType == SORT_SPACE_TYPE_DISK)
++				spill += nstats.spaceUsed;
++
++			/* Check any workers */
++			if (sortstate->shared_info != NULL)
++			{
++				int			n;
++
++				for (n = 0; n < sortstate->shared_info->num_workers; n++)
++				{
++					wstats = &sortstate->shared_info->sinstrument[n];
++					if (wstats->sortMethod == SORT_TYPE_STILL_IN_PROGRESS)
++						continue;
++
++					if (wstats->spaceType == SORT_SPACE_TYPE_DISK)
++						spill += wstats->spaceUsed;
++				}
++			}
++
++			stats->sort_spill = greater_of(stats->sort_spill, spill);
++		}
++	}
++	else if (plan->type == T_AggState)
++	{
++		int64		spill = 0;
++		AggState   *aggstate;
++
++		/* Count this node */
++		stats->hash_nodes = stats->hash_nodes + 1;
++
++		aggstate = castNode(AggState, plan);
++
++		/* Parent process disk spill */
++		spill = aggstate->hash_disk_used;
++
++		/* Workers */
++		if (aggstate->shared_info != NULL)
++		{
++			for (int n = 0; n < aggstate->shared_info->num_workers; n++)
++			{
++				AggregateInstrumentation *sinstrument;
++
++				sinstrument = &aggstate->shared_info->sinstrument[n];
++				/* Skip workers that didn't do anything */
++				if (sinstrument->hash_mem_peak == 0)
++					continue;
++
++				spill += sinstrument->hash_disk_used;
++			}
++		}
++
++		stats->hash_spill = greater_of(stats->hash_spill, spill);
++	}
++
++
++	/* Recurse down both sides of the tree */
++	if (plan->lefttree)
++		get_work_mem_stats(plan->lefttree, stats);
++
++	if (plan->righttree)
++		get_work_mem_stats(plan->righttree, stats);
++}
++
++/*
++ * ExecutorRun hook: all we need do is track nesting depth
++ *
++ * qsort comparator for sorting into increasing disk spill order
++ */
++static int
++entry_cmp(const void *lhs, const void *rhs)
++{
++	/* Sort based on the amount of work_mem that we would allocate */
++	double		l_usage =
++	get_work_mem((*(pgtunerQueryStats * const *) lhs)->sort_spill,
++				 (*(pgtunerQueryStats * const *) lhs)->hash_spill);
++
++	double		r_usage =
++	get_work_mem((*(pgtunerQueryStats * const *) rhs)->sort_spill,
++				 (*(pgtunerQueryStats * const *) rhs)->hash_spill);
++
++	if (l_usage < r_usage)
++		return -1;
++	else if (l_usage > r_usage)
++		return +1;
++	else
++		return 0;
++}
++
++/*
++ * Purge the entry with the least amount of disk spill, if
++ * it exceeds the specified spill
++ *
++ * Caller must hold an exclusive lock on pgtunerState->hashLock.
++ */
++static bool
++entry_dealloc(int desired_work_mem)
++{
++	HASH_SEQ_STATUS hash_seq;
++	pgtunerQueryStats **entries;
++	pgtunerQueryStats *entry;
++	int			i = 0;
++	int			entry_work_mem;
++	bool		purged = false;
++
++	/* Note: this is safe because our caller holds an exclusive lock */
++	entries = palloc(hash_get_num_entries(pgtunerHash) *
++					 sizeof(pgtunerQueryStats *));
++
++	hash_seq_init(&hash_seq, pgtunerHash);
++	while ((entry = hash_seq_search(&hash_seq)) != NULL)
++		entries[i++] = entry;
++
++	/* Sort into increasing order by disk spill */
++	qsort(entries, i, sizeof(pgtunerQueryStats *), entry_cmp);
++
++	/* Remove the first entry, if required */
++	entry_work_mem = get_work_mem(entries[0]->sort_spill,
++								  entries[0]->hash_spill);
++
++	if (entry_work_mem < desired_work_mem)
++	{
++		hash_search(pgtunerHash, &entries[0]->query_id, HASH_REMOVE, NULL);
++		purged = true;
++	}
++
++	pfree(entries);
++
++	/* Increment the number of times entries are deallocated */
++	if (purged)
++	{
++		SpinLockAcquire(&pgtunerState->stateMutex);
++		pgtunerState->deallocs += 1;
++		SpinLockRelease(&pgtunerState->stateMutex);
++	}
++
++	return purged;
++}
++
++/* Update the global statistics */
++static void
++update_global_stats()
++{
++	/* Bail if logging is disabled */
++	if (!logging_enabled())
++		return;
++
++	LWLockAcquire(pgtunerState->hashLock, LW_SHARED);
++	SpinLockAcquire(&pgtunerState->stateMutex);
++	pgtunerState->total_queries++;
++	pgtunerState->unique_queries = hash_get_num_entries(pgtunerHash);
++	SpinLockRelease(&pgtunerState->stateMutex);
++	LWLockRelease(pgtunerState->hashLock);
+ }
+ #endif
+-- 
+2.34.1
+
