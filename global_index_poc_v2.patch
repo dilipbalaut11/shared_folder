@@ -1,0 +1,2807 @@
+diff --git a/contrib/bloom/blinsert.c b/contrib/bloom/blinsert.c
+index 6d3fd5c432..24b57c92ac 100644
+--- a/contrib/bloom/blinsert.c
++++ b/contrib/bloom/blinsert.c
+@@ -195,7 +195,7 @@ blbuildempty(Relation index)
+  * Insert new tuple to the bloom index.
+  */
+ bool
+-blinsert(Relation index, Datum *values, bool *isnull,
++blinsert(void *estate, Relation index, Datum *values, bool *isnull,
+ 		 ItemPointer ht_ctid, Relation heapRel,
+ 		 IndexUniqueCheck checkUnique,
+ 		 IndexInfo *indexInfo)
+diff --git a/contrib/bloom/bloom.h b/contrib/bloom/bloom.h
+index 23aa7ac441..1bf697da89 100644
+--- a/contrib/bloom/bloom.h
++++ b/contrib/bloom/bloom.h
+@@ -189,7 +189,7 @@ extern bool BloomPageAddItem(BloomState *state, Page page, BloomTuple *tuple);
+ extern bool blvalidate(Oid opclassoid);
+ 
+ /* index access method interface functions */
+-extern bool blinsert(Relation index, Datum *values, bool *isnull,
++extern bool blinsert(void *estate, Relation index, Datum *values, bool *isnull,
+ 					 ItemPointer ht_ctid, Relation heapRel,
+ 					 IndexUniqueCheck checkUnique,
+ 					 struct IndexInfo *indexInfo);
+diff --git a/contrib/pageinspect/Makefile b/contrib/pageinspect/Makefile
+index d9d8177116..3fcbfea293 100644
+--- a/contrib/pageinspect/Makefile
++++ b/contrib/pageinspect/Makefile
+@@ -12,7 +12,8 @@ OBJS = \
+ 	rawpage.o
+ 
+ EXTENSION = pageinspect
+-DATA =  pageinspect--1.7--1.8.sql pageinspect--1.6--1.7.sql \
++DATA =  pageinspect--1.8--1.9.sql \
++	pageinspect--1.7--1.8.sql pageinspect--1.6--1.7.sql \
+ 	pageinspect--1.5.sql pageinspect--1.5--1.6.sql \
+ 	pageinspect--1.4--1.5.sql pageinspect--1.3--1.4.sql \
+ 	pageinspect--1.2--1.3.sql pageinspect--1.1--1.2.sql \
+diff --git a/contrib/pageinspect/btreefuncs.c b/contrib/pageinspect/btreefuncs.c
+index 445605db58..d000bc57a3 100644
+--- a/contrib/pageinspect/btreefuncs.c
++++ b/contrib/pageinspect/btreefuncs.c
+@@ -32,6 +32,8 @@
+ #include "catalog/namespace.h"
+ #include "catalog/pg_am.h"
+ #include "catalog/pg_type.h"
++#include "catalog/index.h"
++#include "catalog/pg_inherits.h"
+ #include "funcapi.h"
+ #include "miscadmin.h"
+ #include "pageinspect.h"
+@@ -44,6 +46,7 @@ PG_FUNCTION_INFO_V1(bt_metap);
+ PG_FUNCTION_INFO_V1(bt_page_items);
+ PG_FUNCTION_INFO_V1(bt_page_items_bytea);
+ PG_FUNCTION_INFO_V1(bt_page_stats);
++PG_FUNCTION_INFO_V1(bt_get_global_index_status);
+ 
+ #define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
+ #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
+@@ -55,6 +58,27 @@ PG_FUNCTION_INFO_V1(bt_page_stats);
+ 		if ( RelationGetNumberOfBlocks(rel) <= (BlockNumber) (blkno) ) \
+ 			 elog(ERROR, "block number out of range"); }
+ 
++typedef struct global_index_tup_status
++{
++	Oid		partrel;
++	Relation	rel;
++	uint32	alivetup;
++	uint32	deadtup;
++} global_index_tup_status;
++
++typedef struct global_index_status
++{
++	Page		page;
++	uint32		offset;
++	uint32		numrel;
++	global_index_tup_status	*tupstatus;
++} global_index_status;
++
++static void record_global_index_item(global_index_status *status, Oid relid, bool isdead);
++static void global_index_check_page(Relation rel, BlockNumber blkno, global_index_status *status);
++static Datum print_global_index_status(FuncCallContext *fctx, global_index_status *status, int offset);
++
++
+ /* ------------------------------------------------
+  * structure for single btree page statistics
+  * ------------------------------------------------
+@@ -702,3 +726,225 @@ bt_metap(PG_FUNCTION_ARGS)
+ 
+ 	PG_RETURN_DATUM(result);
+ }
++
++Datum
++bt_get_global_index_status(PG_FUNCTION_ARGS)
++{
++	text	   *relname = PG_GETARG_TEXT_PP(0);
++	Datum		result;
++	FuncCallContext *fctx;
++	MemoryContext mctx;
++	struct global_index_status *uargs;
++
++	if (!superuser())
++		ereport(ERROR,
++				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++				 (errmsg("must be superuser to use pageinspect functions"))));
++
++	if (SRF_IS_FIRSTCALL())
++	{
++		RangeVar   *relrv;
++		Relation	index;
++		Buffer		buffer;
++		TupleDesc	tupleDesc;
++		uint32		num_pages;
++		Oid			partitionOid;
++		Relation	partitionRel;
++		List		*list_children = NIL;
++		int			nlist;
++		int			i;
++		ListCell	*l;
++		BlockNumber blkno;
++
++		fctx = SRF_FIRSTCALL_INIT();
++
++		relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
++		index = relation_openrv(relrv, AccessShareLock);
++
++		if (!IS_INDEX(index) || !IS_BTREE(index))
++			elog(ERROR, "relation \"%s\" is not a btree index",
++				 RelationGetRelationName(index));
++
++		/*
++		 * Reject attempts to read non-local temporary relations; we would be
++		 * likely to get wrong data since we have no visibility into the
++		 * owning session's local buffers.
++		 */
++		if (RELATION_IS_OTHER_TEMP(index))
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("cannot access temporary tables of other sessions")));
++
++		if (!RELATION_INDEX_IS_GLOBAL_INDEX(index))
++			elog(ERROR, "relation \"%s\" is not a global index",
++							 RelationGetRelationName(index));
++
++		partitionOid = IndexGetRelation(RelationGetRelid(index), false);
++		partitionRel = relation_open(partitionOid, AccessShareLock);
++		if (partitionRel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
++			elog(ERROR, "relation \"%s\" is not a partition",
++							 RelationGetRelationName(partitionRel));
++
++		list_children = find_inheritance_children(partitionOid, AccessShareLock);
++		nlist = list_length(list_children);
++		if (nlist <= 0)
++			elog(ERROR, "parition %s have 0 children", RelationGetRelationName(partitionRel));
++
++		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
++		uargs = palloc(sizeof(struct global_index_status));
++		uargs->page = palloc0(BLCKSZ);
++		uargs->offset = 0;
++		uargs->numrel = nlist;
++		uargs->tupstatus = palloc0(sizeof(global_index_tup_status) * nlist);
++		i = 0;
++		foreach(l, list_children)
++		{
++			Oid relid = lfirst_oid(l);
++			global_index_tup_status	*tableinfo = &uargs->tupstatus[i++];
++
++			tableinfo->partrel = relid;
++			tableinfo->rel = relation_open(relid, AccessShareLock);
++		}
++
++		blkno = BTREE_METAPAGE + 1;
++		num_pages = RelationGetNumberOfBlocks(index);
++		for (; blkno < num_pages; blkno++)
++		{
++			buffer = ReadBuffer(index, blkno);
++			LockBuffer(buffer, BUFFER_LOCK_SHARE);
++			memset(uargs->page, 0, BLCKSZ);
++			memcpy(uargs->page, BufferGetPage(buffer), BLCKSZ);
++			UnlockReleaseBuffer(buffer);
++
++			global_index_check_page(index, blkno, uargs);
++		}
++
++		i = 0;
++		for (i = 0; i < uargs->numrel; i++)
++		{
++			global_index_tup_status	*tableinfo = &uargs->tupstatus[i];
++
++			relation_close(tableinfo->rel, AccessShareLock);
++		}
++
++		relation_close(index, AccessShareLock);
++		relation_close(partitionRel, AccessShareLock);
++
++		/* Build a tuple descriptor for our result type */
++		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
++			elog(ERROR, "return type must be a row type");
++
++		fctx->max_calls = uargs->numrel;
++		fctx->attinmeta = TupleDescGetAttInMetadata(tupleDesc);
++		fctx->user_fctx = uargs;
++
++		MemoryContextSwitchTo(mctx);
++	}
++
++	fctx = SRF_PERCALL_SETUP();
++	uargs = fctx->user_fctx;
++
++	if (fctx->call_cntr < fctx->max_calls)
++	{
++		result = print_global_index_status(fctx, uargs, uargs->offset);
++		uargs->offset++;
++		SRF_RETURN_NEXT(fctx, result);
++	}
++	else
++	{
++		pfree(uargs->page);
++		pfree(uargs);
++		SRF_RETURN_DONE(fctx);
++	}
++}
++
++static void
++global_index_check_page(Relation rel, BlockNumber blkno, global_index_status *status)
++{
++	Page		page = status->page;
++	BTPageOpaque opaque = NULL;
++
++	Assert(RELATION_INDEX_IS_GLOBAL_INDEX(rel));
++
++	if (PageIsNew(page))
++		return;
++
++	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
++
++	/* Page is valid, see what to do with it */
++	if (_bt_page_recyclable(page))
++	{
++		;
++	}
++	else if (P_ISDELETED(opaque))
++	{
++		;
++	}
++	else if (P_ISHALFDEAD(opaque))
++	{
++		;
++	}
++	else if (P_ISLEAF(opaque))
++	{
++		OffsetNumber offnum,
++					minoff,
++					maxoff;
++
++		minoff = P_FIRSTDATAKEY(opaque);
++		maxoff = PageGetMaxOffsetNumber(page);
++		if (1)
++		{
++			for (offnum = minoff;
++				 offnum <= maxoff;
++				 offnum = OffsetNumberNext(offnum))
++			{
++				ItemId		iid = PageGetItemId(page, offnum);
++				Oid 		heapOid = 0;
++				IndexTuple	itup;
++
++				itup = (IndexTuple) PageGetItem(page,
++												PageGetItemId(page, offnum));
++
++				heapOid = global_index_itup_fetch_heap_oid(rel, itup);
++				record_global_index_item(status, heapOid, ItemIdIsDead(iid));
++			}
++		}
++	}
++}
++
++static void
++record_global_index_item(global_index_status *status, Oid relid, bool isdead)
++{
++	int		i;
++
++	for(i = 0; i < status->numrel; i++)
++	{
++		global_index_tup_status	*part = &status->tupstatus[i];
++		if (part->partrel == relid)
++		{
++			if (isdead)
++				part->deadtup++;
++			else
++				part->alivetup++;
++		}
++	}
++}
++
++static Datum
++print_global_index_status(FuncCallContext *fctx, global_index_status *status, int offset)
++{
++	char	   *values[3];
++	HeapTuple	tuple;
++	int			j;
++	global_index_tup_status	*tinfo = &status->tupstatus[offset];
++
++	j = 0;
++	values[j++] = psprintf("%s", RelationGetRelationName(tinfo->rel));
++	values[j++] = psprintf("%u", tinfo->alivetup);
++	values[j++] = psprintf("%u", tinfo->deadtup);
++
++	tuple = BuildTupleFromCStrings(fctx->attinmeta, values);
++
++	return HeapTupleGetDatum(tuple);
++}
++
+diff --git a/contrib/pageinspect/pageinspect.control b/contrib/pageinspect/pageinspect.control
+index f8cdf526c6..bd716769a1 100644
+--- a/contrib/pageinspect/pageinspect.control
++++ b/contrib/pageinspect/pageinspect.control
+@@ -1,5 +1,5 @@
+ # pageinspect extension
+ comment = 'inspect the contents of database pages at a low level'
+-default_version = '1.8'
++default_version = '1.9'
+ module_pathname = '$libdir/pageinspect'
+ relocatable = true
+diff --git a/src/backend/access/brin/brin.c b/src/backend/access/brin/brin.c
+index 1f72562c60..7feb3feabd 100644
+--- a/src/backend/access/brin/brin.c
++++ b/src/backend/access/brin/brin.c
+@@ -148,7 +148,7 @@ brinhandler(PG_FUNCTION_ARGS)
+  * it), there's nothing to do for this tuple.
+  */
+ bool
+-brininsert(Relation idxRel, Datum *values, bool *nulls,
++brininsert(void *estate, Relation idxRel, Datum *values, bool *nulls,
+ 		   ItemPointer heaptid, Relation heapRel,
+ 		   IndexUniqueCheck checkUnique,
+ 		   IndexInfo *indexInfo)
+diff --git a/src/backend/access/common/reloptions.c b/src/backend/access/common/reloptions.c
+index 8ccc228a8c..248548d408 100644
+--- a/src/backend/access/common/reloptions.c
++++ b/src/backend/access/common/reloptions.c
+@@ -168,6 +168,17 @@ static relopt_bool boolRelOpts[] =
+ 		},
+ 		true
+ 	},
++
++	{
++		{
++			"global_index",
++			"is global index",
++			RELOPT_KIND_BTREE,
++			ShareUpdateExclusiveLock
++		},
++		false
++	},
++
+ 	/* list terminator */
+ 	{{NULL}}
+ };
+diff --git a/src/backend/access/common/toast_internals.c b/src/backend/access/common/toast_internals.c
+index 25a81e5ec6..b0c747ea6c 100644
+--- a/src/backend/access/common/toast_internals.c
++++ b/src/backend/access/common/toast_internals.c
+@@ -323,7 +323,7 @@ toast_save_datum(Relation rel, Datum value,
+ 		{
+ 			/* Only index relations marked as ready can be updated */
+ 			if (toastidxs[i]->rd_index->indisready)
+-				index_insert(toastidxs[i], t_values, t_isnull,
++				index_insert(NULL, toastidxs[i], t_values, t_isnull,
+ 							 &(toasttup->t_self),
+ 							 toastrel,
+ 							 toastidxs[i]->rd_index->indisunique ?
+diff --git a/src/backend/access/gin/gininsert.c b/src/backend/access/gin/gininsert.c
+index 77433dc8a4..bcfeba6bbd 100644
+--- a/src/backend/access/gin/gininsert.c
++++ b/src/backend/access/gin/gininsert.c
+@@ -485,7 +485,7 @@ ginHeapTupleInsert(GinState *ginstate, OffsetNumber attnum,
+ }
+ 
+ bool
+-gininsert(Relation index, Datum *values, bool *isnull,
++gininsert(void *estate, Relation index, Datum *values, bool *isnull,
+ 		  ItemPointer ht_ctid, Relation heapRel,
+ 		  IndexUniqueCheck checkUnique,
+ 		  IndexInfo *indexInfo)
+diff --git a/src/backend/access/gist/gist.c b/src/backend/access/gist/gist.c
+index 3f2b416ce1..e859467972 100644
+--- a/src/backend/access/gist/gist.c
++++ b/src/backend/access/gist/gist.c
+@@ -153,7 +153,7 @@ gistbuildempty(Relation index)
+  *	  It doesn't do any work; just locks the relation and passes the buck.
+  */
+ bool
+-gistinsert(Relation r, Datum *values, bool *isnull,
++gistinsert(void *estate, Relation r, Datum *values, bool *isnull,
+ 		   ItemPointer ht_ctid, Relation heapRel,
+ 		   IndexUniqueCheck checkUnique,
+ 		   IndexInfo *indexInfo)
+diff --git a/src/backend/access/hash/hash.c b/src/backend/access/hash/hash.c
+index 7c9ccf446c..0d10f154cf 100644
+--- a/src/backend/access/hash/hash.c
++++ b/src/backend/access/hash/hash.c
+@@ -244,7 +244,7 @@ hashbuildCallback(Relation index,
+  *	Find the appropriate location for the new tuple, and put it there.
+  */
+ bool
+-hashinsert(Relation rel, Datum *values, bool *isnull,
++hashinsert(void *estate, Relation rel, Datum *values, bool *isnull,
+ 		   ItemPointer ht_ctid, Relation heapRel,
+ 		   IndexUniqueCheck checkUnique,
+ 		   IndexInfo *indexInfo)
+diff --git a/src/backend/access/heap/heapam_handler.c b/src/backend/access/heap/heapam_handler.c
+index 3eea215b85..d8581c085b 100644
+--- a/src/backend/access/heap/heapam_handler.c
++++ b/src/backend/access/heap/heapam_handler.c
+@@ -1949,7 +1949,8 @@ heapam_index_validate_scan(Relation heapRelation,
+ 			 * there is one.
+ 			 */
+ 
+-			index_insert(indexRelation,
++			index_insert(estate,
++						 indexRelation,
+ 						 values,
+ 						 isnull,
+ 						 &rootTuple,
+diff --git a/src/backend/access/heap/vacuumlazy.c b/src/backend/access/heap/vacuumlazy.c
+index 25f2d5df1b..fd97ed5d99 100644
+--- a/src/backend/access/heap/vacuumlazy.c
++++ b/src/backend/access/heap/vacuumlazy.c
+@@ -349,12 +349,14 @@ static bool lazy_check_needs_freeze(Buffer buf, bool *hastup,
+ static void lazy_vacuum_all_indexes(Relation onerel, Relation *Irel,
+ 									IndexBulkDeleteResult **stats,
+ 									LVRelStats *vacrelstats, LVParallelState *lps,
+-									int nindexes);
++									int nindexes, Oid heapOid);
+ static void lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
+-							  LVDeadTuples *dead_tuples, double reltuples, LVRelStats *vacrelstats);
++							  LVDeadTuples *dead_tuples, double reltuples, LVRelStats *vacrelstats,
++							  Oid heapOid);
+ static void lazy_cleanup_index(Relation indrel,
+ 							   IndexBulkDeleteResult **stats,
+-							   double reltuples, bool estimated_count, LVRelStats *vacrelstats);
++							   double reltuples, bool estimated_count, LVRelStats *vacrelstats,
++							   Oid heapOid);
+ static int	lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
+ 							 int tupindex, LVRelStats *vacrelstats, Buffer *vmbuffer);
+ static bool should_attempt_truncation(VacuumParams *params,
+@@ -384,7 +386,7 @@ static void vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
+ 							 LVDeadTuples *dead_tuples, LVRelStats *vacrelstats);
+ static void lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
+ 									 LVRelStats *vacrelstats, LVParallelState *lps,
+-									 int nindexes);
++									 int nindexes, Oid heapOid);
+ static long compute_max_dead_tuples(BlockNumber relblocks, bool hasindex);
+ static int	compute_parallel_vacuum_workers(Relation *Irel, int nindexes, int nrequested,
+ 											bool *can_parallel_vacuum);
+@@ -820,6 +822,18 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
+ 	 */
+ 	if (params->nworkers >= 0 && vacrelstats->useindex && nindexes > 1)
+ 	{
++		bool	have_global_index = false;
++		int		idx;
++
++		for (idx = 0; idx < nindexes; idx++)
++		{
++			if (RELATION_INDEX_IS_GLOBAL_INDEX(Irel[idx]))
++			{
++				have_global_index = true;
++				break;
++			}
++		}
++
+ 		/*
+ 		 * Since parallel workers cannot access data in temporary tables, we
+ 		 * can't perform parallel vacuum on them.
+@@ -835,6 +849,8 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
+ 						(errmsg("disabling parallel option of vacuum on \"%s\" --- cannot vacuum temporary tables in parallel",
+ 								vacrelstats->relname)));
+ 		}
++		else if (have_global_index)
++			elog(WARNING, "Temporarily disable vacuum global index.");
+ 		else
+ 			lps = begin_parallel_vacuum(RelationGetRelid(onerel), Irel,
+ 										vacrelstats, nblocks, nindexes,
+@@ -1052,7 +1068,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
+ 
+ 			/* Work on all the indexes, then the heap */
+ 			lazy_vacuum_all_indexes(onerel, Irel, indstats,
+-									vacrelstats, lps, nindexes);
++									vacrelstats, lps, nindexes, heapOid);
+ 
+ 			/* Remove tuples from heap */
+ 			lazy_vacuum_heap(onerel, vacrelstats);
+@@ -1705,7 +1721,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
+ 	{
+ 		/* Work on all the indexes, and then the heap */
+ 		lazy_vacuum_all_indexes(onerel, Irel, indstats, vacrelstats,
+-								lps, nindexes);
++								lps, nindexes, heapOid);
+ 
+ 		/* Remove tuples from heap */
+ 		lazy_vacuum_heap(onerel, vacrelstats);
+@@ -1723,7 +1739,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
+ 
+ 	/* Do post-vacuum cleanup */
+ 	if (vacrelstats->useindex)
+-		lazy_cleanup_all_indexes(Irel, indstats, vacrelstats, lps, nindexes);
++		lazy_cleanup_all_indexes(Irel, indstats, vacrelstats, lps, nindexes, heapOid);
+ 
+ 	/*
+ 	 * End parallel mode before updating index statistics as we cannot write
+@@ -1784,7 +1800,7 @@ static void
+ lazy_vacuum_all_indexes(Relation onerel, Relation *Irel,
+ 						IndexBulkDeleteResult **stats,
+ 						LVRelStats *vacrelstats, LVParallelState *lps,
+-						int nindexes)
++						int nindexes, Oid heapOid)
+ {
+ 	Assert(!IsParallelWorker());
+ 	Assert(nindexes > 0);
+@@ -1818,7 +1834,8 @@ lazy_vacuum_all_indexes(Relation onerel, Relation *Irel,
+ 
+ 		for (idx = 0; idx < nindexes; idx++)
+ 			lazy_vacuum_index(Irel[idx], &stats[idx], vacrelstats->dead_tuples,
+-							  vacrelstats->old_live_tuples, vacrelstats);
++							  vacrelstats->old_live_tuples, vacrelstats,
++							  heapOid);
+ 	}
+ 
+ 	/* Increase and report the number of index scans */
+@@ -2319,6 +2336,7 @@ vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
+ {
+ 	IndexBulkDeleteResult *bulkdelete_res = NULL;
+ 
++	Assert(!RELATION_INDEX_IS_GLOBAL_INDEX(indrel));
+ 	if (shared_indstats)
+ 	{
+ 		/* Get the space for IndexBulkDeleteResult */
+@@ -2335,10 +2353,11 @@ vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
+ 	/* Do vacuum or cleanup of the index */
+ 	if (lvshared->for_cleanup)
+ 		lazy_cleanup_index(indrel, stats, lvshared->reltuples,
+-						   lvshared->estimated_count, vacrelstats);
++						   lvshared->estimated_count, vacrelstats, InvalidOid);
+ 	else
+ 		lazy_vacuum_index(indrel, stats, dead_tuples,
+-						  lvshared->reltuples, vacrelstats);
++						  lvshared->reltuples, vacrelstats,
++						  InvalidOid);
+ 
+ 	/*
+ 	 * Copy the index bulk-deletion result returned from ambulkdelete and
+@@ -2375,7 +2394,7 @@ vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
+ static void
+ lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
+ 						 LVRelStats *vacrelstats, LVParallelState *lps,
+-						 int nindexes)
++						 int nindexes, Oid heapOid)
+ {
+ 	int			idx;
+ 
+@@ -2414,7 +2433,7 @@ lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
+ 			lazy_cleanup_index(Irel[idx], &stats[idx],
+ 							   vacrelstats->new_rel_tuples,
+ 							   vacrelstats->tupcount_pages < vacrelstats->rel_pages,
+-							   vacrelstats);
++							   vacrelstats, heapOid);
+ 	}
+ }
+ 
+@@ -2429,14 +2448,17 @@ lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
+  */
+ static void
+ lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
+-				  LVDeadTuples *dead_tuples, double reltuples, LVRelStats *vacrelstats)
++				  LVDeadTuples *dead_tuples, double reltuples, LVRelStats *vacrelstats,
++				  Oid heapOid)
+ {
+ 	IndexVacuumInfo ivinfo;
+ 	PGRUsage	ru0;
+ 	LVSavedErrInfo saved_err_info;
++	int		level = elevel;
+ 
+ 	pg_rusage_init(&ru0);
+ 
++	memset(&ivinfo, 0, sizeof(IndexVacuumInfo));
+ 	ivinfo.index = indrel;
+ 	ivinfo.analyze_only = false;
+ 	ivinfo.report_progress = false;
+@@ -2444,6 +2466,12 @@ lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
+ 	ivinfo.message_level = elevel;
+ 	ivinfo.num_heap_tuples = reltuples;
+ 	ivinfo.strategy = vac_strategy;
++	ivinfo.global_index = RELATION_INDEX_IS_GLOBAL_INDEX(indrel);
++	if (ivinfo.global_index)
++	{
++		level = WARNING;
++		ivinfo.heap_oid = heapOid;
++	}
+ 
+ 	/*
+ 	 * Update error traceback information.
+@@ -2461,7 +2489,7 @@ lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
+ 	*stats = index_bulk_delete(&ivinfo, *stats,
+ 							   lazy_tid_reaped, (void *) dead_tuples);
+ 
+-	ereport(elevel,
++	ereport(level,
+ 			(errmsg("scanned index \"%s\" to remove %d row versions",
+ 					vacrelstats->indname,
+ 					dead_tuples->num_tuples),
+@@ -2482,7 +2510,8 @@ lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
+ static void
+ lazy_cleanup_index(Relation indrel,
+ 				   IndexBulkDeleteResult **stats,
+-				   double reltuples, bool estimated_count, LVRelStats *vacrelstats)
++				   double reltuples, bool estimated_count, LVRelStats *vacrelstats,
++				   Oid heapOid)
+ {
+ 	IndexVacuumInfo ivinfo;
+ 	PGRUsage	ru0;
+@@ -2490,6 +2519,7 @@ lazy_cleanup_index(Relation indrel,
+ 
+ 	pg_rusage_init(&ru0);
+ 
++	memset(&ivinfo, 0, sizeof(IndexVacuumInfo));
+ 	ivinfo.index = indrel;
+ 	ivinfo.analyze_only = false;
+ 	ivinfo.report_progress = false;
+@@ -2498,6 +2528,9 @@ lazy_cleanup_index(Relation indrel,
+ 
+ 	ivinfo.num_heap_tuples = reltuples;
+ 	ivinfo.strategy = vac_strategy;
++	ivinfo.global_index = RELATION_INDEX_IS_GLOBAL_INDEX(indrel);
++	if (ivinfo.global_index)
++		ivinfo.heap_oid = heapOid;
+ 
+ 	/*
+ 	 * Update error traceback information.
+diff --git a/src/backend/access/index/genam.c b/src/backend/access/index/genam.c
+index e3164e674a..ea63959a05 100644
+--- a/src/backend/access/index/genam.c
++++ b/src/backend/access/index/genam.c
+@@ -82,7 +82,7 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
+ {
+ 	IndexScanDesc scan;
+ 
+-	scan = (IndexScanDesc) palloc(sizeof(IndexScanDescData));
++	scan = (IndexScanDesc) palloc0(sizeof(IndexScanDescData));
+ 
+ 	scan->heapRelation = NULL;	/* may be set later */
+ 	scan->xs_heapfetch = NULL;
+@@ -126,6 +126,14 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
+ 	scan->xs_hitup = NULL;
+ 	scan->xs_hitupdesc = NULL;
+ 
++	if (RELATION_INDEX_IS_GLOBAL_INDEX(indexRelation))
++	{
++		scan->xs_am_global_index = true;
++		scan->xs_want_itup = true;
++		scan->xs_globalindex_rel_directory =
++			CreateGlobalIndexRelDirectory(CurrentMemoryContext);
++	}
++
+ 	return scan;
+ }
+ 
+@@ -412,6 +420,7 @@ systable_beginscan(Relation heapRelation,
+ 
+ 		sysscan->iscan = index_beginscan(heapRelation, irel,
+ 										 snapshot, nkeys, 0);
++		Assert(!sysscan->iscan->xs_am_global_index);
+ 		index_rescan(sysscan->iscan, key, nkeys, NULL, 0);
+ 		sysscan->scan = NULL;
+ 	}
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index 3fb8688f8f..d2581aff58 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -104,10 +104,25 @@ do { \
+ 			 CppAsString(pname), RelationGetRelationName(scan->indexRelation)); \
+ } while(0)
+ 
++typedef struct GlobalIndexRelDirectoryData
++{
++	MemoryContext pdir_mcxt;
++	HTAB	   *pdir_hash;
++}GlobalIndexRelDirectoryData;
++
++typedef struct GlobalIndexRelDirectoryEntry
++{
++	Oid 		reloid;
++	Relation	rel;
++	IndexFetchTableData *xs_heapfetch;
++}GlobalIndexRelDirectoryEntry;
++
+ static IndexScanDesc index_beginscan_internal(Relation indexRelation,
+ 											  int nkeys, int norderbys, Snapshot snapshot,
+ 											  ParallelIndexScanDesc pscan, bool temp_snap);
+ 
++static GlobalIndexRelDirectoryEntry *GlobalIndexRelEntryLookup(GlobalIndexRelDirectory pdir, Oid relid, bool heapfetch);
++static void ResetGlobalIndexRelDirectory(GlobalIndexRelDirectory pdir);
+ 
+ /* ----------------------------------------------------------------
+  *				   index_ interface functions
+@@ -173,7 +188,8 @@ index_close(Relation relation, LOCKMODE lockmode)
+  * ----------------
+  */
+ bool
+-index_insert(Relation indexRelation,
++index_insert(void *estate, 
++			 Relation indexRelation,
+ 			 Datum *values,
+ 			 bool *isnull,
+ 			 ItemPointer heap_t_ctid,
+@@ -189,7 +205,7 @@ index_insert(Relation indexRelation,
+ 									   (ItemPointer) NULL,
+ 									   InvalidBlockNumber);
+ 
+-	return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
++	return indexRelation->rd_indam->aminsert(estate, indexRelation, values, isnull,
+ 											 heap_t_ctid, heapRelation,
+ 											 checkUnique, indexInfo);
+ }
+@@ -213,11 +229,19 @@ index_beginscan(Relation heapRelation,
+ 	 * Save additional parameters into the scandesc.  Everything else was set
+ 	 * up by RelationGetIndexScan.
+ 	 */
+-	scan->heapRelation = heapRelation;
+ 	scan->xs_snapshot = snapshot;
+ 
+-	/* prepare to fetch index matches from table */
+-	scan->xs_heapfetch = table_index_fetch_begin(heapRelation);
++	if (scan->xs_am_global_index)
++	{
++		scan->heapRelation = NULL;
++		scan->xs_heapfetch = NULL;
++	}
++	else
++	{
++		scan->heapRelation = heapRelation;
++		/* prepare to fetch index matches from table */
++		scan->xs_heapfetch = table_index_fetch_begin(heapRelation);
++	}
+ 
+ 	return scan;
+ }
+@@ -235,8 +259,11 @@ index_beginscan_bitmap(Relation indexRelation,
+ {
+ 	IndexScanDesc scan;
+ 
++	Assert(!RELATION_INDEX_IS_GLOBAL_INDEX(indexRelation));
+ 	scan = index_beginscan_internal(indexRelation, nkeys, 0, snapshot, NULL, false);
+ 
++	Assert(!scan->xs_am_global_index);
++
+ 	/*
+ 	 * Save additional parameters into the scandesc.  Everything else was set
+ 	 * up by RelationGetIndexScan.
+@@ -303,7 +330,14 @@ index_rescan(IndexScanDesc scan,
+ 	Assert(norderbys == scan->numberOfOrderBys);
+ 
+ 	/* Release resources (like buffer pins) from table accesses */
+-	if (scan->xs_heapfetch)
++	if (scan->xs_am_global_index)
++	{
++		scan->xs_heapfetch = NULL;
++		scan->heapRelation = NULL;
++		if (scan->xs_globalindex_rel_directory)
++			ResetGlobalIndexRelDirectory(scan->xs_globalindex_rel_directory);
++	}
++	else if (scan->xs_heapfetch)
+ 		table_index_fetch_reset(scan->xs_heapfetch);
+ 
+ 	scan->kill_prior_tuple = false; /* for safety */
+@@ -324,7 +358,13 @@ index_endscan(IndexScanDesc scan)
+ 	CHECK_SCAN_PROCEDURE(amendscan);
+ 
+ 	/* Release resources (like buffer pins) from table accesses */
+-	if (scan->xs_heapfetch)
++	if (scan->xs_am_global_index)
++	{
++		scan->xs_heapfetch = NULL;
++		if (scan->xs_globalindex_rel_directory)
++			DestroyGlobalIndexRelDirectory(scan->xs_globalindex_rel_directory);
++	}
++	else if (scan->xs_heapfetch)
+ 	{
+ 		table_index_fetch_end(scan->xs_heapfetch);
+ 		scan->xs_heapfetch = NULL;
+@@ -380,7 +420,14 @@ index_restrpos(IndexScanDesc scan)
+ 	CHECK_SCAN_PROCEDURE(amrestrpos);
+ 
+ 	/* release resources (like buffer pins) from table accesses */
+-	if (scan->xs_heapfetch)
++	if (scan->xs_am_global_index)
++	{
++		scan->xs_heapfetch = NULL;
++		scan->xs_heapfetch = NULL;
++		if (scan->xs_globalindex_rel_directory)
++			ResetGlobalIndexRelDirectory(scan->xs_globalindex_rel_directory);
++	}
++	else if (scan->xs_heapfetch)
+ 		table_index_fetch_reset(scan->xs_heapfetch);
+ 
+ 	scan->kill_prior_tuple = false; /* for safety */
+@@ -491,6 +538,7 @@ index_beginscan_parallel(Relation heaprel, Relation indexrel, int nkeys,
+ 	scan = index_beginscan_internal(indexrel, nkeys, norderbys, snapshot,
+ 									pscan, true);
+ 
++	Assert(!scan->xs_am_global_index);
+ 	/*
+ 	 * Save additional parameters into the scandesc.  Everything else was set
+ 	 * up by index_beginscan_internal.
+@@ -589,7 +637,7 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
+ 	 * recovery because it may violate MVCC to do so.  See comments in
+ 	 * RelationGetIndexScan().
+ 	 */
+-	if (!scan->xactStartedInRecovery)
++	if (!scan->xactStartedInRecovery && !scan->xs_am_global_index)
+ 		scan->kill_prior_tuple = all_dead;
+ 
+ 	return found;
+@@ -635,6 +683,43 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
+ 		 * the index.
+ 		 */
+ 		Assert(ItemPointerIsValid(&scan->xs_heaptid));
++
++		if (scan->xs_am_global_index)
++		{
++			IndexTuple	itup;
++			Oid			heapoid;
++			GlobalIndexRelDirectoryEntry *entry;
++
++			Assert(scan->xs_want_itup);
++			Assert(scan->xs_itup);
++			itup = scan->xs_itup;
++			heapoid = global_index_itup_fetch_heap_oid(scan->indexRelation, itup);
++
++			if (scan->heapRelation &&
++				heapoid == RelationGetRelid(scan->heapRelation))
++			{
++				Assert(scan->xs_heapfetch);
++			}
++			else if (scan->heapRelation == NULL)
++			{
++				Assert(scan->xs_heapfetch == NULL);
++				entry = GlobalIndexRelEntryLookup(scan->xs_globalindex_rel_directory, heapoid, true);
++				scan->heapRelation = entry->rel;
++				scan->xs_heapfetch = entry->xs_heapfetch;
++			}
++			else if (scan->heapRelation &&
++				heapoid != RelationGetRelid(scan->heapRelation))
++			{
++				Assert(scan->xs_heapfetch);
++				table_index_fetch_reset(scan->xs_heapfetch);
++				entry = GlobalIndexRelEntryLookup(scan->xs_globalindex_rel_directory, heapoid, true);
++				scan->heapRelation = entry->rel;
++				scan->xs_heapfetch = entry->xs_heapfetch;
++			}
++			else
++				Assert(false);
++		}
++
+ 		if (index_fetch_heap(scan, slot))
+ 			return true;
+ 	}
+@@ -980,3 +1065,123 @@ index_opclass_options(Relation indrel, AttrNumber attnum, Datum attoptions,
+ 
+ 	return build_local_reloptions(&relopts, attoptions, validate);
+ }
++
++GlobalIndexRelDirectory
++CreateGlobalIndexRelDirectory(MemoryContext mcxt)
++{
++	MemoryContext oldcontext = MemoryContextSwitchTo(mcxt);
++	GlobalIndexRelDirectory pdir;
++	HASHCTL		ctl;
++
++	MemSet(&ctl, 0, sizeof(HASHCTL));
++	ctl.keysize = sizeof(Oid);
++	ctl.entrysize = sizeof(GlobalIndexRelDirectoryEntry);
++	ctl.hcxt = mcxt;
++
++	pdir = palloc(sizeof(GlobalIndexRelDirectoryData));
++	pdir->pdir_mcxt = mcxt;
++	pdir->pdir_hash = hash_create("GlobalIndex Rel Directory", 256, &ctl,
++								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++
++	MemoryContextSwitchTo(oldcontext);
++	return pdir;
++}
++
++static GlobalIndexRelDirectoryEntry *
++GlobalIndexRelEntryLookup(GlobalIndexRelDirectory pdir, Oid relid, bool heapfetch)
++{
++	GlobalIndexRelDirectoryEntry *pde;
++	bool		found;
++	Relation	part_rel;
++
++	Assert(OidIsValid(relid));
++	Assert(pdir);
++	pde = hash_search(pdir->pdir_hash, &relid, HASH_FIND, &found);
++	if (found)
++	{
++		Assert(pde->rel);
++		if (heapfetch)
++			Assert(pde->xs_heapfetch);
++
++		return pde;
++	}
++	else
++	{
++		pde = hash_search(pdir->pdir_hash, &relid, HASH_ENTER, &found);
++		part_rel = table_open(relid, AccessShareLock);
++		pde->rel = part_rel;
++		if (heapfetch)
++			pde->xs_heapfetch = table_index_fetch_begin(part_rel);
++		else
++			pde->xs_heapfetch = NULL;
++	}
++
++	return pde;
++}
++
++Relation
++GlobalIndexRelLookup(GlobalIndexRelDirectory pdir, Oid relid)
++{
++	GlobalIndexRelDirectoryEntry *pde;
++
++	Assert(pdir);
++	pde = GlobalIndexRelEntryLookup(pdir, relid, false);
++	Assert(pde);
++
++	return pde->rel;
++}
++
++void
++DestroyGlobalIndexRelDirectory(GlobalIndexRelDirectory pdir)
++{
++	HASH_SEQ_STATUS status;
++	GlobalIndexRelDirectoryEntry *pde;
++
++	hash_seq_init(&status, pdir->pdir_hash);
++	while ((pde = hash_seq_search(&status)) != NULL)
++	{
++		if (pde->xs_heapfetch)
++		{
++			table_index_fetch_end(pde->xs_heapfetch);
++			pde->xs_heapfetch = NULL;
++		}
++
++		table_close(pde->rel, NoLock);
++	}
++}
++
++static void
++ResetGlobalIndexRelDirectory(GlobalIndexRelDirectory pdir)
++{
++	HASH_SEQ_STATUS status;
++	GlobalIndexRelDirectoryEntry *entry;
++
++	hash_seq_init(&status, pdir->pdir_hash);
++	while ((entry = hash_seq_search(&status)))
++	{
++		if (entry->xs_heapfetch)
++			table_index_fetch_reset(entry->xs_heapfetch);
++	}
++}
++
++Oid
++global_index_itup_fetch_heap_oid(Relation index, IndexTuple itup)
++{
++	Datum		datum;
++	bool		isNull;
++	Oid 		heapOid_index;
++	int 		indnatts = IndexRelationGetNumberOfAttributes(index);
++	TupleDesc	tupleDesc = RelationGetDescr(index);
++
++	Assert(RELATION_INDEX_IS_GLOBAL_INDEX(index));
++
++	datum = index_getattr(itup, indnatts, tupleDesc, &isNull);
++	Assert(!isNull);
++	heapOid_index = DatumGetObjectId(datum);
++	Assert(OidIsValid(heapOid_index));
++
++	output_tid_info(heapOid_index, itup->t_tid, "curitup");
++
++	return heapOid_index;
++}
++
+diff --git a/src/backend/access/nbtree/nbtinsert.c b/src/backend/access/nbtree/nbtinsert.c
+index dde43b1415..b2d617067a 100644
+--- a/src/backend/access/nbtree/nbtinsert.c
++++ b/src/backend/access/nbtree/nbtinsert.c
+@@ -24,13 +24,17 @@
+ #include "storage/lmgr.h"
+ #include "storage/predicate.h"
+ #include "storage/smgr.h"
++#include "nodes/execnodes.h"
++
++#include "storage/itemptr.h"
++#include "partitioning/partdesc.h"
+ 
+ /* Minimum tree height for application of fastpath optimization */
+ #define BTREE_FASTPATH_MIN_LEVEL	2
+ 
+ 
+ static BTStack _bt_search_insert(Relation rel, BTInsertState insertstate);
+-static TransactionId _bt_check_unique(Relation rel, BTInsertState insertstate,
++static TransactionId _bt_check_unique(void *estate, Relation rel, BTInsertState insertstate,
+ 									  Relation heapRel,
+ 									  IndexUniqueCheck checkUnique, bool *is_unique,
+ 									  uint32 *speculativeToken);
+@@ -82,7 +86,7 @@ static void _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
+  *		that's just a coding artifact.)
+  */
+ bool
+-_bt_doinsert(Relation rel, IndexTuple itup,
++_bt_doinsert(void *estate, Relation rel, IndexTuple itup,
+ 			 IndexUniqueCheck checkUnique, Relation heapRel)
+ {
+ 	bool		is_unique = false;
+@@ -189,7 +193,7 @@ search:
+ 		TransactionId xwait;
+ 		uint32		speculativeToken;
+ 
+-		xwait = _bt_check_unique(rel, &insertstate, heapRel, checkUnique,
++		xwait = _bt_check_unique(estate, rel, &insertstate, heapRel, checkUnique,
+ 								 &is_unique, &speculativeToken);
+ 
+ 		if (unlikely(TransactionIdIsValid(xwait)))
+@@ -387,7 +391,7 @@ _bt_search_insert(Relation rel, BTInsertState insertstate)
+  * prepared to handle that correctly.
+  */
+ static TransactionId
+-_bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
++_bt_check_unique(void *estate, Relation rel, BTInsertState insertstate, Relation heapRel,
+ 				 IndexUniqueCheck checkUnique, bool *is_unique,
+ 				 uint32 *speculativeToken)
+ {
+@@ -491,6 +495,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
+ 			if (inposting || !ItemIdIsDead(curitemid))
+ 			{
+ 				ItemPointerData htid;
++				Relation	heap_rel;
+ 				bool		all_dead = false;
+ 
+ 				if (!inposting)
+@@ -526,6 +531,11 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
+ 					htid = *BTreeTupleGetPostingN(curitup, curposti);
+ 				}
+ 
++				if(RELATION_INDEX_IS_GLOBAL_INDEX(rel))
++					heap_rel = bt_global_index_partrel_routing(estate, heapRel, rel, curitup);
++				else
++					heap_rel = heapRel;
++
+ 				/*
+ 				 * If we are doing a recheck, we expect to find the tuple we
+ 				 * are rechecking.  It's not a duplicate, but we have to keep
+@@ -543,7 +553,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
+ 				 * with optimizations like heap's HOT, we have just a single
+ 				 * index entry for the entire chain.
+ 				 */
+-				else if (table_index_fetch_tuple_check(heapRel, &htid,
++				else if (table_index_fetch_tuple_check(heap_rel, &htid,
+ 													   &SnapshotDirty,
+ 													   &all_dead))
+ 				{
+@@ -605,6 +615,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
+ 													  SnapshotSelf, NULL))
+ 					{
+ 						/* Normal case --- it's still live */
++						output_tid_info(RelationGetRelid(heapRel), htid, "bt_check_unique fail");
+ 					}
+ 					else
+ 					{
+@@ -2716,3 +2727,37 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
+ 		_bt_dedup_pass(rel, buffer, heapRel, insertstate->itup,
+ 					   insertstate->itemsz, checkingunique);
+ }
++
++static Relation
++bt_global_index_partrel_routing(void *estate, Relation heap_rel, Relation index, IndexTuple index_tup)
++{
++	Oid			heapOid_index;
++	Oid			heapOid;
++	EState		*es = (EState *)estate;
++	int 		indnatts = IndexRelationGetNumberOfAttributes(index);
++	TupleDesc	tupleDesc = RelationGetDescr(index);
++	Form_pg_attribute att = TupleDescAttr(tupleDesc, indnatts - 1);
++	Relation	part_rel;
++
++	if(!RELATION_INDEX_IS_GLOBAL_INDEX(index))
++		return heap_rel;
++
++	heapOid = RelationGetRelid(heap_rel);
++	heapOid_index = global_index_itup_fetch_heap_oid(index, index_tup);
++	if (OidIsValid(heapOid_index))
++	{
++		if (heapOid == heapOid_index)
++			return heap_rel;
++	}
++	else
++		elog(ERROR, "global index %s have invalid tableoid column %s on attnum %d", RelationGetRelationName(index), NameStr(att->attname), indnatts - 1);
++
++	if (es == NULL || es->es_global_index_partrel_directory == NULL)
++		elog(ERROR, "global index scan must have rel directory");
++
++	part_rel = GlobalIndexRelLookup(es->es_global_index_partrel_directory, heapOid_index);
++	Assert(part_rel);
++
++	return part_rel;
++}
++
+diff --git a/src/backend/access/nbtree/nbtree.c b/src/backend/access/nbtree/nbtree.c
+index 0abec10798..03446ef2d2 100644
+--- a/src/backend/access/nbtree/nbtree.c
++++ b/src/backend/access/nbtree/nbtree.c
+@@ -196,7 +196,7 @@ btbuildempty(Relation index)
+  *		new tuple, and put it there.
+  */
+ bool
+-btinsert(Relation rel, Datum *values, bool *isnull,
++btinsert(void *estate, Relation rel, Datum *values, bool *isnull,
+ 		 ItemPointer ht_ctid, Relation heapRel,
+ 		 IndexUniqueCheck checkUnique,
+ 		 IndexInfo *indexInfo)
+@@ -208,7 +208,7 @@ btinsert(Relation rel, Datum *values, bool *isnull,
+ 	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
+ 	itup->t_tid = *ht_ctid;
+ 
+-	result = _bt_doinsert(rel, itup, checkUnique, heapRel);
++	result = _bt_doinsert(estate, rel, itup, checkUnique, heapRel);
+ 
+ 	pfree(itup);
+ 
+@@ -1108,9 +1108,17 @@ btvacuumpage(BTVacState *vstate, BlockNumber scanblkno)
+ 	Buffer		buf;
+ 	Page		page;
+ 	BTPageOpaque opaque;
++	Oid			heap_oid = InvalidOid;
+ 
+ 	blkno = scanblkno;
+ 
++	if (info->global_index)
++	{
++		Assert(RELATION_INDEX_IS_GLOBAL_INDEX(rel));
++		Assert(OidIsValid(info->heap_oid));
++		heap_oid = info->heap_oid;
++	}
++
+ backtrack:
+ 
+ 	attempt_pagedel = false;
+@@ -1275,6 +1283,13 @@ backtrack:
+ 				itup = (IndexTuple) PageGetItem(page,
+ 												PageGetItemId(page, offnum));
+ 
++				if (RELATION_INDEX_IS_GLOBAL_INDEX(rel))
++				{
++					Oid heap_in_index = global_index_itup_fetch_heap_oid(rel, itup);
++					if (heap_in_index != heap_oid)
++						continue;
++				}
++
+ 				/*
+ 				 * Hot Standby assumes that it's okay that XLOG_BTREE_VACUUM
+ 				 * records do not produce their own conflicts.  This is safe
+diff --git a/src/backend/access/nbtree/nbtsort.c b/src/backend/access/nbtree/nbtsort.c
+index 8730de25ed..b5a369c5e8 100644
+--- a/src/backend/access/nbtree/nbtsort.c
++++ b/src/backend/access/nbtree/nbtsort.c
+@@ -473,8 +473,10 @@ _bt_spools_heapscan(Relation heap, Relation index, BTBuildState *buildstate,
+ 										coordinate2, false);
+ 	}
+ 
++	if (RELATION_IS_PARTITION(heap))
++		reltuples = 0;
+ 	/* Fill spool using either serial or parallel heap scan */
+-	if (!buildstate->btleader)
++	else if (!buildstate->btleader)
+ 		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
+ 										   _bt_build_callback, (void *) buildstate,
+ 										   NULL);
+diff --git a/src/backend/access/nbtree/nbtutils.c b/src/backend/access/nbtree/nbtutils.c
+index 2f5f14e527..45158e3f8e 100644
+--- a/src/backend/access/nbtree/nbtutils.c
++++ b/src/backend/access/nbtree/nbtutils.c
+@@ -1727,6 +1727,7 @@ _bt_killitems(IndexScanDesc scan)
+ 	bool		killedsomething = false;
+ 	bool		droppedpin PG_USED_FOR_ASSERTS_ONLY;
+ 
++	Assert(!scan->xs_am_global_index);
+ 	Assert(BTScanPosIsValid(so->currPos));
+ 
+ 	/*
+@@ -2108,7 +2109,9 @@ btoptions(Datum reloptions, bool validate)
+ 		{"vacuum_cleanup_index_scale_factor", RELOPT_TYPE_REAL,
+ 		offsetof(BTOptions, vacuum_cleanup_index_scale_factor)},
+ 		{"deduplicate_items", RELOPT_TYPE_BOOL,
+-		offsetof(BTOptions, deduplicate_items)}
++		offsetof(BTOptions, deduplicate_items)},
++		{"global_index", RELOPT_TYPE_BOOL,
++		offsetof(BTOptions, global_index)}
+ 
+ 	};
+ 
+@@ -2749,3 +2752,17 @@ _bt_allequalimage(Relation rel, bool debugmessage)
+ 
+ 	return allequalimage;
+ }
++
++inline bool
++RELATION_INDEX_IS_GLOBAL_INDEX(Relation relation)
++{
++	bool is_global_index = false;
++
++	if ((relation)->rd_options &&
++		(relation)->rd_rel->relkind == RELKIND_INDEX &&
++		(relation)->rd_rel->relam == BTREE_AM_OID)
++		is_global_index = ((BTOptions *) (relation)->rd_options)->global_index;
++
++	return is_global_index;
++}
++
+diff --git a/src/backend/access/spgist/spginsert.c b/src/backend/access/spgist/spginsert.c
+index e4508a2b92..83eec914d6 100644
+--- a/src/backend/access/spgist/spginsert.c
++++ b/src/backend/access/spgist/spginsert.c
+@@ -204,7 +204,7 @@ spgbuildempty(Relation index)
+  * Insert one new tuple into an SPGiST index.
+  */
+ bool
+-spginsert(Relation index, Datum *values, bool *isnull,
++spginsert(void *estate, Relation index, Datum *values, bool *isnull,
+ 		  ItemPointer ht_ctid, Relation heapRel,
+ 		  IndexUniqueCheck checkUnique,
+ 		  IndexInfo *indexInfo)
+diff --git a/src/backend/access/table/tableam.c b/src/backend/access/table/tableam.c
+index 6438c45716..fe44589816 100644
+--- a/src/backend/access/table/tableam.c
++++ b/src/backend/access/table/tableam.c
+@@ -71,6 +71,10 @@ table_slot_callbacks(Relation relation)
+ 		 */
+ 		tts_cb = &TTSOpsHeapTuple;
+ 	}
++	else if(relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
++	{
++		tts_cb = &TTSOpsBufferHeapTuple;
++	}
+ 	else
+ 	{
+ 		/*
+diff --git a/src/backend/catalog/index.c b/src/backend/catalog/index.c
+index 731610c701..c5d1e227fe 100644
+--- a/src/backend/catalog/index.c
++++ b/src/backend/catalog/index.c
+@@ -333,12 +333,21 @@ ConstructTupleDescriptor(Relation heapRelation,
+ 			/* Simple index column */
+ 			const FormData_pg_attribute *from;
+ 
+-			Assert(atnum > 0);	/* should've been caught above */
+-
+ 			if (atnum > natts)	/* safety check */
+ 				elog(ERROR, "invalid column number %d", atnum);
+-			from = TupleDescAttr(heapTupDesc,
++
++			if (atnum < 0)
++			{
++				/*
++				 * here we are indexing on a system attribute (-1...-n)
++				 */
++				from = SystemAttributeDefinition(atnum);
++			}
++			else
++			{
++				from = TupleDescAttr(heapTupDesc,
+ 								 AttrNumberGetAttrOffset(atnum));
++			}
+ 
+ 			to->atttypid = from->atttypid;
+ 			to->attlen = from->attlen;
+@@ -2926,7 +2935,7 @@ index_update_stats(Relation rel,
+ 
+ 	if (reltuples >= 0)
+ 	{
+-		BlockNumber relpages = RelationGetNumberOfBlocks(rel);
++		BlockNumber relpages = RELATION_IS_PARTITION(rel) ? 0 : RelationGetNumberOfBlocks(rel);
+ 		BlockNumber relallvisible;
+ 
+ 		if (rd_rel->relkind != RELKIND_INDEX)
+@@ -2999,6 +3008,9 @@ index_build(Relation heapRelation,
+ 	int			save_sec_context;
+ 	int			save_nestlevel;
+ 
++	if (RELATION_INDEX_IS_GLOBAL_INDEX(indexRelation))
++		parallel = false;
++
+ 	/*
+ 	 * sanity checks
+ 	 */
+@@ -3394,6 +3406,7 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
+ 	/*
+ 	 * Scan the index and gather up all the TIDs into a tuplesort object.
+ 	 */
++	memset(&ivinfo, 0, sizeof(IndexVacuumInfo));
+ 	ivinfo.index = indexRelation;
+ 	ivinfo.analyze_only = false;
+ 	ivinfo.report_progress = true;
+@@ -3402,6 +3415,10 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
+ 	ivinfo.num_heap_tuples = heapRelation->rd_rel->reltuples;
+ 	ivinfo.strategy = NULL;
+ 
++	ivinfo.global_index = RELATION_INDEX_IS_GLOBAL_INDEX(indexRelation);
++	if (ivinfo.global_index)
++		ivinfo.heap_oid = RelationGetRelid(heapRelation);
++
+ 	/*
+ 	 * Encode TIDs as int8 values for the sort, rather than directly sorting
+ 	 * item pointers.  This can be significantly faster, primarily because TID
+diff --git a/src/backend/catalog/indexing.c b/src/backend/catalog/indexing.c
+index 538f6a06b8..3a941ea73e 100644
+--- a/src/backend/catalog/indexing.c
++++ b/src/backend/catalog/indexing.c
+@@ -49,7 +49,7 @@ CatalogOpenIndexes(Relation heapRel)
+ 	resultRelInfo->ri_RelationDesc = heapRel;
+ 	resultRelInfo->ri_TrigDesc = NULL;	/* we don't fire triggers */
+ 
+-	ExecOpenIndices(resultRelInfo, false);
++	ExecOpenIndices(NULL, resultRelInfo, false, false);
+ 
+ 	return resultRelInfo;
+ }
+@@ -155,7 +155,8 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple)
+ 		/*
+ 		 * The index AM does the rest.
+ 		 */
+-		index_insert(index,		/* index relation */
++		index_insert(NULL,
++					 index,		/* index relation */
+ 					 values,	/* array of index Datums */
+ 					 isnull,	/* is-null flags */
+ 					 &(heapTuple->t_self),	/* tid of heap tuple */
+diff --git a/src/backend/commands/analyze.c b/src/backend/commands/analyze.c
+index 8af12b5c6b..4d5ee5b2d6 100644
+--- a/src/backend/commands/analyze.c
++++ b/src/backend/commands/analyze.c
+@@ -662,6 +662,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
+ 			IndexBulkDeleteResult *stats;
+ 			IndexVacuumInfo ivinfo;
+ 
++			memset(&ivinfo, 0, sizeof(IndexVacuumInfo));
+ 			ivinfo.index = Irel[ind];
+ 			ivinfo.analyze_only = true;
+ 			ivinfo.estimated_count = true;
+diff --git a/src/backend/commands/constraint.c b/src/backend/commands/constraint.c
+index fc19307bf2..3a9fcf02bc 100644
+--- a/src/backend/commands/constraint.c
++++ b/src/backend/commands/constraint.c
+@@ -173,7 +173,7 @@ unique_key_recheck(PG_FUNCTION_ARGS)
+ 		 * the row is now dead, because that is the TID the index will know
+ 		 * about.
+ 		 */
+-		index_insert(indexRel, values, isnull, &checktid,
++		index_insert(estate, indexRel, values, isnull, &checktid,
+ 					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING,
+ 					 indexInfo);
+ 	}
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index d797b5f53e..7ebd7a36cb 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -14,6 +14,7 @@
+ #include "postgres.h"
+ 
+ #include "access/xact.h"
++#include "access/genam.h"
+ #include "catalog/pg_type.h"
+ #include "commands/createas.h"
+ #include "commands/defrem.h"
+@@ -38,6 +39,7 @@
+ #include "utils/tuplesort.h"
+ #include "utils/typcache.h"
+ #include "utils/xml.h"
++#include "utils/relcache.h"
+ 
+ 
+ /* Hook for plugins to get control in ExplainOneQuery() */
+@@ -1209,7 +1211,17 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 			pname = sname = "Gather Merge";
+ 			break;
+ 		case T_IndexScan:
+-			pname = sname = "Index Scan";
++			{
++				IndexScan	*iscan = (IndexScan *)plan;
++				Relation	index = index_open(iscan->indexid, NoLock);
++
++				if (RELATION_INDEX_IS_GLOBAL_INDEX(index))
++					pname = sname = "Global Index Scan";
++				else
++					pname = sname = "Index Scan";
++
++				index_close(index, NoLock);
++			}
+ 			break;
+ 		case T_IndexOnlyScan:
+ 			pname = sname = "Index Only Scan";
+diff --git a/src/backend/commands/indexcmds.c b/src/backend/commands/indexcmds.c
+index 14d24b3cc4..724bcb2354 100644
+--- a/src/backend/commands/indexcmds.c
++++ b/src/backend/commands/indexcmds.c
+@@ -39,6 +39,7 @@
+ #include "commands/progress.h"
+ #include "commands/tablecmds.h"
+ #include "commands/tablespace.h"
++#include "executor/executor.h"
+ #include "mb/pg_wchar.h"
+ #include "miscadmin.h"
+ #include "nodes/makefuncs.h"
+@@ -65,6 +66,7 @@
+ #include "utils/regproc.h"
+ #include "utils/snapmgr.h"
+ #include "utils/syscache.h"
++#include "utils/rel.h"
+ 
+ 
+ /* non-export function prototypes */
+@@ -591,6 +593,8 @@ DefineIndex(Oid relationId,
+ 	 */
+ 	numberOfKeyAttributes = list_length(stmt->indexParams);
+ 
++	check_global_index_include_clause(stmt);
++
+ 	/*
+ 	 * Calculate the new list of index columns including both key columns and
+ 	 * INCLUDE columns.  Later we can determine which of these are key
+@@ -849,6 +853,8 @@ DefineIndex(Oid relationId,
+ 	if (stmt->whereClause)
+ 		CheckPredicate((Expr *) stmt->whereClause);
+ 
++	global_index_option_check(rel, stmt);
++
+ 	/*
+ 	 * Parse AM-specific options, convert to text array form, validate.
+ 	 */
+@@ -1000,7 +1006,7 @@ DefineIndex(Oid relationId,
+ 				}
+ 			}
+ 
+-			if (!found)
++			if (!found && !stmt->global_index)
+ 			{
+ 				Form_pg_attribute att;
+ 
+@@ -1025,7 +1031,8 @@ DefineIndex(Oid relationId,
+ 	{
+ 		AttrNumber	attno = indexInfo->ii_IndexAttrNumbers[i];
+ 
+-		if (attno < 0)
++		if ((attno < 0 && !stmt->global_index) ||
++			(stmt->global_index && attno < 0 && attno != TableOidAttributeNumber))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+ 					 errmsg("index creation on system columns is not supported")));
+@@ -1097,13 +1104,13 @@ DefineIndex(Oid relationId,
+ 	flags = constr_flags = 0;
+ 	if (stmt->isconstraint)
+ 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
+-	if (skip_build || concurrent || partitioned)
++	if (skip_build || concurrent || (partitioned && !stmt->global_index))
+ 		flags |= INDEX_CREATE_SKIP_BUILD;
+ 	if (stmt->if_not_exists)
+ 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
+ 	if (concurrent)
+ 		flags |= INDEX_CREATE_CONCURRENT;
+-	if (partitioned)
++	if (partitioned && !stmt->global_index)
+ 		flags |= INDEX_CREATE_PARTITIONED;
+ 	if (stmt->primary)
+ 		flags |= INDEX_CREATE_IS_PRIMARY;
+@@ -1161,7 +1168,7 @@ DefineIndex(Oid relationId,
+ 		CreateComments(indexRelationId, RelationRelationId, 0,
+ 					   stmt->idxcomment);
+ 
+-	if (partitioned)
++	if (partitioned && !stmt->global_index)
+ 	{
+ 		PartitionDesc partdesc;
+ 
+@@ -3991,3 +3998,200 @@ set_indexsafe_procflags(void)
+ 	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
+ 	LWLockRelease(ProcArrayLock);
+ }
++
++static void
++global_index_option_check(Relation rel, IndexStmt *stmt)
++{
++	check_global_index_option(stmt->options);
++
++	if(!stmt->global_index)
++		return;
++
++	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
++		elog(ERROR, "global index must create on partition table");
++
++	store_global_index_option(stmt);
++
++	if (stmt->concurrent)
++		elog(ERROR, "create global index does not support concurrent mode");
++}
++
++static void
++check_global_index_option(List *options)
++{
++	ListCell		*listptr;
++
++	if (options == NIL)
++		return;
++
++	foreach(listptr, options)
++	{
++		DefElem    *def = (DefElem *) lfirst(listptr);
++
++		if (strcmp(def->defname, "global_index") == 0)
++		{
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("can not set or reset parameter \"global_index\"")));
++
++		}
++	}
++
++	return;
++}
++
++static void
++check_global_index_include_clause(IndexStmt *stmt)
++{
++	ListCell *lc;
++	IndexElem	*iparam;
++
++	if(!stmt->global_index)
++		return;
++
++	foreach(lc, stmt->indexIncludingParams)
++	{
++		char	*key = strVal(lfirst(lc));
++
++		if (pg_strcasecmp("tableoid", key) == 0)
++			elog(ERROR, "global index can not have tableoid column in include clause");
++	}
++
++	iparam = makeNode(IndexElem);
++	iparam->name = pstrdup("tableoid");
++	iparam->expr = NULL;
++	iparam->indexcolname = NULL;
++	iparam->collation = NIL;
++	iparam->opclass = NIL;
++	stmt->indexIncludingParams = lappend(stmt->indexIncludingParams, iparam);
++
++	return;
++}
++
++static void
++store_global_index_option(IndexStmt *stmt)
++{
++	DefElem		*opt;
++
++	opt = makeNode(DefElem);
++	opt->type = T_DefElem;
++	opt->defnamespace = NULL;
++	opt->defname = "deduplicate_items";
++	opt->defaction = DEFELEM_UNSPEC;
++	opt->arg  = (Node *)makeString("false");
++	stmt->options = lappend(stmt->options, opt);
++
++	opt = makeNode(DefElem);
++	opt->type = T_DefElem;
++	opt->defnamespace = NULL;
++	opt->defname = "global_index";
++	opt->defaction = DEFELEM_UNSPEC;
++	opt->arg  = (Node *)makeString("true");
++	stmt->options = lappend(stmt->options, opt);
++
++	return;
++}
++
++static void
++reindex_global_index(Oid global_index)
++{
++	Relation		global_rel,
++					main_partion_rel;
++	Oid				heapId;
++	MemoryContext	oldcontext = CurrentMemoryContext;
++	MemoryContext	context;
++	int64			pressrow = 0;
++	List			*all_children;
++	ListCell		*lc;
++
++	heapId = IndexGetRelation(global_index, false);
++	global_rel = index_open(global_index, AccessExclusiveLock);
++	main_partion_rel = table_open(heapId, ShareLock);
++
++	context = AllocSetContextCreate(CurrentMemoryContext,
++									"build global index",
++									ALLOCSET_DEFAULT_SIZES);
++
++	MemoryContextSwitchTo(context);
++
++	all_children = find_inheritance_children(heapId, ShareLock);
++	foreach(lc, all_children)
++	{
++		Oid			child_oid = lfirst_oid(lc);
++
++		pressrow += global_index_build_one_rel(child_oid, global_index);
++	}
++
++	MemoryContextSwitchTo(oldcontext);
++	MemoryContextDelete(context);
++
++	table_close(main_partion_rel, NoLock);
++	index_close(global_rel, NoLock);
++
++	elog(WARNING, "build global index insert %d rows", (int)pressrow);
++
++	return;
++}
++
++static int64
++global_index_build_one_rel(Oid relid, Oid global_index)
++{
++	int64			pressrow = 0;
++	Relation		rel;
++	TableScanDesc	scandesc;
++	TupleTableSlot *slot;
++	EState			*estate;
++	ResultRelInfo	*resultRelInfo;
++
++	rel = table_open(relid, NoLock);
++
++	estate = CreateExecutorState();
++	resultRelInfo = makeNode(ResultRelInfo);
++	InitResultRelInfo(resultRelInfo,
++					  rel,
++					  1,
++					  NULL,
++					  0);
++
++	CheckValidResultRel(resultRelInfo, CMD_INSERT);
++	ExecOpenGLobalIndex(estate, resultRelInfo, global_index);
++
++	estate->es_result_relations = resultRelInfo;
++	estate->es_num_result_relations = 1;
++	estate->es_result_relation_info = resultRelInfo;
++
++	slot = table_slot_create(rel, NULL);
++
++	scandesc = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
++	while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
++	{
++		CHECK_FOR_INTERRUPTS();
++
++		slot_getallattrs(slot);
++
++		if (resultRelInfo->ri_NumIndices > 0)
++		{
++			ExecInsertIndexTuples(slot,
++								   estate,
++								   false,
++								   NULL,
++								   NIL);
++
++			pressrow++;
++		}
++
++		ResetPerTupleExprContext(estate);
++		ExecClearTuple(slot);
++	}
++
++	table_endscan(scandesc);
++
++	ExecDropSingleTupleTableSlot(slot);
++	ExecCloseIndices(resultRelInfo);
++	FreeExecutorState(estate);
++
++	table_close(rel, NoLock);
++
++	return pressrow;
++}
++
+diff --git a/src/backend/commands/vacuum.c b/src/backend/commands/vacuum.c
+index 98270a1049..064c690805 100644
+--- a/src/backend/commands/vacuum.c
++++ b/src/backend/commands/vacuum.c
+@@ -35,6 +35,7 @@
+ #include "catalog/pg_database.h"
+ #include "catalog/pg_inherits.h"
+ #include "catalog/pg_namespace.h"
++#include "catalog/partition.h"
+ #include "commands/cluster.h"
+ #include "commands/defrem.h"
+ #include "commands/vacuum.h"
+@@ -53,6 +54,7 @@
+ #include "utils/memutils.h"
+ #include "utils/snapmgr.h"
+ #include "utils/syscache.h"
++#include "utils/lsyscache.h"
+ 
+ 
+ /*
+@@ -1986,10 +1988,25 @@ vac_open_indexes(Relation relation, LOCKMODE lockmode,
+ 	List	   *indexoidlist;
+ 	ListCell   *indexoidscan;
+ 	int			i;
++	List		*global_indexs = NIL;
++	Oid			relid = RelationGetRelid(relation);
++	bool		relispartition = get_rel_relispartition(relid);
+ 
+ 	Assert(lockmode != NoLock);
+ 
++	if (relispartition)
++	{
++		Oid 		parent = get_partition_parent(relid);
++		Relation	rel;
++
++		rel = table_open(parent, AccessShareLock);
++		global_indexs = relation_get_global_index_list(rel);
++		table_close(rel, AccessShareLock);
++	}
++
+ 	indexoidlist = RelationGetIndexList(relation);
++	if (global_indexs)
++		indexoidlist = list_concat_unique_oid(indexoidlist, global_indexs);
+ 
+ 	/* allocate enough memory for all indexes */
+ 	i = list_length(indexoidlist);
+diff --git a/src/backend/executor/execIndexing.c b/src/backend/executor/execIndexing.c
+index c6b5bcba7b..05773b2ab3 100644
+--- a/src/backend/executor/execIndexing.c
++++ b/src/backend/executor/execIndexing.c
+@@ -110,11 +110,15 @@
+ #include "access/relscan.h"
+ #include "access/tableam.h"
+ #include "access/xact.h"
++#include "access/table.h"
+ #include "catalog/index.h"
++#include "catalog/partition.h"
+ #include "executor/executor.h"
+ #include "nodes/nodeFuncs.h"
+ #include "storage/lmgr.h"
+ #include "utils/snapmgr.h"
++#include "utils/lsyscache.h"
++#include "partitioning/partdesc.h"
+ 
+ /* waitMode argument to check_exclusion_or_unique_constraint() */
+ typedef enum
+@@ -148,7 +152,7 @@ static bool index_recheck_constraint(Relation index, Oid *constr_procs,
+  * ----------------------------------------------------------------
+  */
+ void
+-ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
++ExecOpenIndices(EState *estate, ResultRelInfo *resultRelInfo, bool speculative, bool include_global_index)
+ {
+ 	Relation	resultRelation = resultRelInfo->ri_RelationDesc;
+ 	List	   *indexoidlist;
+@@ -157,17 +161,49 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
+ 				i;
+ 	RelationPtr relationDescs;
+ 	IndexInfo **indexInfoArray;
++	List		*global_indexs = NIL;
+ 
+ 	resultRelInfo->ri_NumIndices = 0;
+ 
++	if (include_global_index)
++	{
++		Oid 	relid = RelationGetRelid(resultRelation);
++		bool	relispartition = get_rel_relispartition(relid);
++
++		if (relispartition)
++		{
++			Oid			parent = get_partition_parent(relid);
++			Relation	rel;
++
++			rel = table_open(parent, AccessShareLock);
++			global_indexs = relation_get_global_index_list(rel);
++			table_close(rel, AccessShareLock);
++
++			if (global_indexs)
++			{
++				if (estate == NULL)
++					elog(ERROR, "global indes scan need estate");
++
++				if (estate->es_global_index_partrel_directory == NULL)
++				{
++					estate->es_global_index_partrel_directory =
++						CreateGlobalIndexRelDirectory(estate->es_query_cxt);
++				}
++			}
++		}
++	}
++
+ 	/* fast path if no indexes */
+-	if (!RelationGetForm(resultRelation)->relhasindex)
++	if (global_indexs == NIL &&
++		!RelationGetForm(resultRelation)->relhasindex)
+ 		return;
+ 
+ 	/*
+ 	 * Get cached list of index OIDs
+ 	 */
+ 	indexoidlist = RelationGetIndexList(resultRelation);
++	if (global_indexs)
++		indexoidlist = list_concat_unique_oid(indexoidlist, global_indexs);
+ 	len = list_length(indexoidlist);
+ 	if (len == 0)
+ 		return;
+@@ -390,7 +426,8 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
+ 			checkUnique = UNIQUE_CHECK_PARTIAL;
+ 
+ 		satisfiesConstraint =
+-			index_insert(indexRelation, /* index relation */
++			index_insert(estate,
++						 indexRelation, /* index relation */
+ 						 values,	/* array of index Datums */
+ 						 isnull,	/* null flags */
+ 						 tupleid,	/* tid of heap tuple */
+@@ -899,3 +936,66 @@ index_recheck_constraint(Relation index, Oid *constr_procs,
+ 
+ 	return true;
+ }
++
++void
++ExecOpenGLobalIndex(EState *estate, ResultRelInfo *resultRelInfo, Oid global_index)
++{
++	List	   *indexoidlist = NIL;
++	ListCell   *l;
++	int			len,
++				i;
++	RelationPtr relationDescs;
++	IndexInfo **indexInfoArray;
++
++	Assert(OidIsValid(global_index));
++	if (estate->es_global_index_partrel_directory == NULL)
++	{
++		estate->es_global_index_partrel_directory =
++			CreateGlobalIndexRelDirectory(estate->es_query_cxt);
++	}
++
++	resultRelInfo->ri_NumIndices = 0;
++
++	/*
++	 * Get cached list of index OIDs
++	 */
++	indexoidlist = lappend_oid(indexoidlist, global_index);
++	len = list_length(indexoidlist);
++
++	/*
++	 * allocate space for result arrays
++	 */
++	relationDescs = (RelationPtr) palloc(len * sizeof(Relation));
++	indexInfoArray = (IndexInfo **) palloc(len * sizeof(IndexInfo *));
++
++	resultRelInfo->ri_NumIndices = len;
++	resultRelInfo->ri_IndexRelationDescs = relationDescs;
++	resultRelInfo->ri_IndexRelationInfo = indexInfoArray;
++
++	/*
++	 * For each index, open the index relation and save pg_index info. We
++	 * acquire RowExclusiveLock, signifying we will update the index.
++	 *
++	 * Note: we do this even if the index is not indisready; it's not worth
++	 * the trouble to optimize for the case where it isn't.
++	 */
++	i = 0;
++	foreach(l, indexoidlist)
++	{
++		Oid			indexOid = lfirst_oid(l);
++		Relation	indexDesc;
++		IndexInfo  *ii;
++
++		indexDesc = index_open(indexOid, RowExclusiveLock);
++
++		/* extract index key information from the index's pg_index info */
++		ii = BuildIndexInfo(indexDesc);
++
++		relationDescs[i] = indexDesc;
++		indexInfoArray[i] = ii;
++		i++;
++	}
++
++	list_free(indexoidlist);
++}
++
+diff --git a/src/backend/executor/execPartition.c b/src/backend/executor/execPartition.c
+index 97bfc8bd71..ad28eb732d 100644
+--- a/src/backend/executor/execPartition.c
++++ b/src/backend/executor/execPartition.c
+@@ -599,11 +599,11 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
+ 	 * error.  Be prepared in that case by initializing the index information
+ 	 * needed by ExecInsert() to perform speculative insertions.
+ 	 */
+-	if (partrel->rd_rel->relhasindex &&
+-		leaf_part_rri->ri_IndexRelationDescs == NULL)
+-		ExecOpenIndices(leaf_part_rri,
++	if (leaf_part_rri->ri_IndexRelationDescs == NULL)
++		ExecOpenIndices(estate, leaf_part_rri,
+ 						(node != NULL &&
+-						 node->onConflictAction != ONCONFLICT_NONE));
++						 node->onConflictAction != ONCONFLICT_NONE),
++						 true);
+ 
+ 	/*
+ 	 * Build WITH CHECK OPTION constraints for the partition.  Note that we
+diff --git a/src/backend/executor/execUtils.c b/src/backend/executor/execUtils.c
+index 071a0007eb..324ef2c978 100644
+--- a/src/backend/executor/execUtils.c
++++ b/src/backend/executor/execUtils.c
+@@ -45,6 +45,7 @@
+ 
+ #include "postgres.h"
+ 
++#include "access/genam.h"
+ #include "access/parallel.h"
+ #include "access/relscan.h"
+ #include "access/table.h"
+@@ -215,6 +216,12 @@ FreeExecutorState(EState *estate)
+ 		estate->es_partition_directory = NULL;
+ 	}
+ 
++	if (estate->es_global_index_partrel_directory)
++	{
++		DestroyGlobalIndexRelDirectory(estate->es_global_index_partrel_directory);
++		estate->es_global_index_partrel_directory = NULL;
++	}
++
+ 	/*
+ 	 * Free the per-query memory context, thereby releasing all working
+ 	 * memory, including the EState node itself.
+diff --git a/src/backend/executor/nodeIndexonlyscan.c b/src/backend/executor/nodeIndexonlyscan.c
+index 5617ac29e7..5f887acdd0 100644
+--- a/src/backend/executor/nodeIndexonlyscan.c
++++ b/src/backend/executor/nodeIndexonlyscan.c
+@@ -97,6 +97,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
+ 								   node->ioss_NumOrderByKeys);
+ 
+ 		node->ioss_ScanDesc = scandesc;
++		Assert(!scandesc->xs_am_global_index);
+ 
+ 
+ 		/* Set it up for index-only scan */
+diff --git a/src/backend/executor/nodeIndexscan.c b/src/backend/executor/nodeIndexscan.c
+index d0a96a38e0..af83d4e4b8 100644
+--- a/src/backend/executor/nodeIndexscan.c
++++ b/src/backend/executor/nodeIndexscan.c
+@@ -212,6 +212,8 @@ IndexNextWithReorder(IndexScanState *node)
+ 
+ 		node->iss_ScanDesc = scandesc;
+ 
++		Assert(!scandesc->xs_am_global_index);
++
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and
+ 		 * pass the scankeys to the index AM.
+diff --git a/src/backend/executor/nodeModifyTable.c b/src/backend/executor/nodeModifyTable.c
+index ab3d655e60..d8d67a94b1 100644
+--- a/src/backend/executor/nodeModifyTable.c
++++ b/src/backend/executor/nodeModifyTable.c
+@@ -57,6 +57,7 @@
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
+ 
++#include "storage/itemptr.h"
+ 
+ static bool ExecOnConflictUpdate(ModifyTableState *mtstate,
+ 								 ResultRelInfo *resultRelInfo,
+@@ -636,6 +637,8 @@ ExecInsert(ModifyTableState *mtstate,
+ 							   estate->es_output_cid,
+ 							   0, NULL);
+ 
++			output_tid_info(RelationGetRelid(resultRelationDesc), slot->tts_tid, "INSERT");
++
+ 			/* insert index entries for tuple */
+ 			if (resultRelInfo->ri_NumIndices > 0)
+ 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
+@@ -977,7 +980,10 @@ ldelete:;
+ 
+ 	/* Tell caller that the delete actually happened. */
+ 	if (tupleDeleted)
++	{
+ 		*tupleDeleted = true;
++		output_tid_info(RelationGetRelid(resultRelationDesc), *tupleid, "DELETE");
++	}
+ 
+ 	/*
+ 	 * If this delete is the result of a partition key update that moved the
+@@ -2280,11 +2286,11 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
+ 		 * already, since we share the resultrel state with the original
+ 		 * query.
+ 		 */
+-		if (resultRelInfo->ri_RelationDesc->rd_rel->relhasindex &&
+-			operation != CMD_DELETE &&
++		if (operation != CMD_DELETE &&
+ 			resultRelInfo->ri_IndexRelationDescs == NULL)
+-			ExecOpenIndices(resultRelInfo,
+-							node->onConflictAction != ONCONFLICT_NONE);
++			ExecOpenIndices(estate, resultRelInfo,
++							node->onConflictAction != ONCONFLICT_NONE,
++							true);
+ 
+ 		/*
+ 		 * If this is an UPDATE and a BEFORE UPDATE trigger is present, the
+diff --git a/src/backend/nodes/copyfuncs.c b/src/backend/nodes/copyfuncs.c
+index 70f8b718e0..3598a5312c 100644
+--- a/src/backend/nodes/copyfuncs.c
++++ b/src/backend/nodes/copyfuncs.c
+@@ -3525,6 +3525,7 @@ _copyIndexStmt(const IndexStmt *from)
+ 	COPY_SCALAR_FIELD(concurrent);
+ 	COPY_SCALAR_FIELD(if_not_exists);
+ 	COPY_SCALAR_FIELD(reset_default_tblspc);
++	COPY_SCALAR_FIELD(global_index);
+ 
+ 	return newnode;
+ }
+diff --git a/src/backend/nodes/equalfuncs.c b/src/backend/nodes/equalfuncs.c
+index 541e0e6b48..c5fee1690a 100644
+--- a/src/backend/nodes/equalfuncs.c
++++ b/src/backend/nodes/equalfuncs.c
+@@ -1354,6 +1354,7 @@ _equalIndexStmt(const IndexStmt *a, const IndexStmt *b)
+ 	COMPARE_SCALAR_FIELD(concurrent);
+ 	COMPARE_SCALAR_FIELD(if_not_exists);
+ 	COMPARE_SCALAR_FIELD(reset_default_tblspc);
++	COMPARE_SCALAR_FIELD(global_index);
+ 
+ 	return true;
+ }
+diff --git a/src/backend/nodes/outfuncs.c b/src/backend/nodes/outfuncs.c
+index d78b16ed1d..218a2a1569 100644
+--- a/src/backend/nodes/outfuncs.c
++++ b/src/backend/nodes/outfuncs.c
+@@ -2353,6 +2353,8 @@ _outIndexOptInfo(StringInfo str, const IndexOptInfo *node)
+ 	WRITE_BOOL_FIELD(unique);
+ 	WRITE_BOOL_FIELD(immediate);
+ 	WRITE_BOOL_FIELD(hypothetical);
++
++	WRITE_BOOL_FIELD(is_global_index);
+ 	/* we don't bother with fields copied from the index AM's API struct */
+ }
+ 
+@@ -2705,6 +2707,7 @@ _outIndexStmt(StringInfo str, const IndexStmt *node)
+ 	WRITE_BOOL_FIELD(concurrent);
+ 	WRITE_BOOL_FIELD(if_not_exists);
+ 	WRITE_BOOL_FIELD(reset_default_tblspc);
++	WRITE_BOOL_FIELD(global_index);
+ }
+ 
+ static void
+diff --git a/src/backend/optimizer/path/allpaths.c b/src/backend/optimizer/path/allpaths.c
+index 627d08b78a..85669e01b6 100644
+--- a/src/backend/optimizer/path/allpaths.c
++++ b/src/backend/optimizer/path/allpaths.c
+@@ -1174,6 +1174,8 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
+ 		}
+ 	}
+ 
++	check_index_predicates(root, rel);
++
+ 	if (has_live_children)
+ 	{
+ 		/*
+@@ -1271,6 +1273,8 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+ 
+ 	/* Add paths to the append relation. */
+ 	add_paths_to_append_rel(root, rel, live_childrels);
++
++	create_index_paths(root, rel);
+ }
+ 
+ 
+diff --git a/src/backend/optimizer/path/indxpath.c b/src/backend/optimizer/path/indxpath.c
+index bcb1bc6097..6d32e1aefe 100644
+--- a/src/backend/optimizer/path/indxpath.c
++++ b/src/backend/optimizer/path/indxpath.c
+@@ -1811,6 +1811,9 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
+ 	if (!enable_indexonlyscan)
+ 		return false;
+ 
++	if (index->is_global_index)
++		return false;
++
+ 	/*
+ 	 * Check that all needed attributes of the relation are available from the
+ 	 * index.
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 1a94b58f8b..9744b948ec 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -7386,7 +7386,22 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
+ 	 * main list, and finally zap the partial pathlist.
+ 	 */
+ 	if (rel_is_partitioned)
+-		rel->pathlist = NIL;
++	{
++		List	*index_path_list = NIL;
++
++		foreach(lc, rel->pathlist)
++		{
++			Path	   *subpath = (Path *) lfirst(lc);
++
++			if (nodeTag(subpath) == T_IndexPath)
++				index_path_list = lappend(index_path_list, subpath);
++		}
++
++		if (index_path_list)
++			rel->pathlist = index_path_list;
++		else
++			rel->pathlist = NIL;
++	}
+ 
+ 	/*
+ 	 * If the scan/join target is not parallel-safe, partial paths cannot
+diff --git a/src/backend/optimizer/util/plancat.c b/src/backend/optimizer/util/plancat.c
+index daf1759623..1766e78bb6 100644
+--- a/src/backend/optimizer/util/plancat.c
++++ b/src/backend/optimizer/util/plancat.c
+@@ -115,8 +115,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ {
+ 	Index		varno = rel->relid;
+ 	Relation	relation;
+-	bool		hasindex;
++	bool		hasindex = false;
+ 	List	   *indexinfos = NIL;
++	List		*global_indexs = NIL;
+ 
+ 	/*
+ 	 * We need not lock the relation since it was already locked, either by
+@@ -163,6 +164,13 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 	else
+ 		hasindex = relation->rd_rel->relhasindex;
+ 
++	if (RELATION_IS_PARTITION(relation) && enable_global_index_scan)
++	{
++		global_indexs = relation_get_global_index_list(relation);
++		if (global_indexs)
++			hasindex = true;
++	}
++
+ 	if (hasindex)
+ 	{
+ 		List	   *indexoidlist;
+@@ -170,6 +178,11 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 		ListCell   *l;
+ 
+ 		indexoidlist = RelationGetIndexList(relation);
++		if (global_indexs)
++		{
++			indexoidlist = list_concat_unique_oid(indexoidlist, global_indexs);
++			list_free(global_indexs);
++		}
+ 
+ 		/*
+ 		 * For each index, we get the same type of lock that the executor will
+@@ -245,6 +258,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 
+ 			info = makeNode(IndexOptInfo);
+ 
++			if (RELATION_INDEX_IS_GLOBAL_INDEX(indexRelation))
++				info->is_global_index = true;
++
+ 			info->indexoid = index->indexrelid;
+ 			info->reltablespace =
+ 				RelationGetForm(indexRelation)->reltablespace;
+@@ -279,10 +295,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 			info->amoptionalkey = amroutine->amoptionalkey;
+ 			info->amsearcharray = amroutine->amsearcharray;
+ 			info->amsearchnulls = amroutine->amsearchnulls;
+-			info->amcanparallel = amroutine->amcanparallel;
+ 			info->amhasgettuple = (amroutine->amgettuple != NULL);
+-			info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
+-				relation->rd_tableam->scan_bitmap_next_block != NULL;
++
+ 			info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
+ 								  amroutine->amrestrpos != NULL);
+ 			info->amcostestimate = amroutine->amcostestimate;
+@@ -291,6 +305,18 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 			/* Fetch index opclass options */
+ 			info->opclassoptions = RelationGetIndexAttOptions(indexRelation, true);
+ 
++			if (info->is_global_index)
++			{
++				info->amcanparallel = false;
++				info->amhasgetbitmap = false;
++			}
++			else
++			{
++				info->amcanparallel = amroutine->amcanparallel;
++				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
++					relation->rd_tableam->scan_bitmap_next_block != NULL;
++			}
++
+ 			/*
+ 			 * Fetch the ordering information for the index, if any.
+ 			 */
+diff --git a/src/backend/parser/gram.y b/src/backend/parser/gram.y
+index 8f341ac006..877277ff16 100644
+--- a/src/backend/parser/gram.y
++++ b/src/backend/parser/gram.y
+@@ -593,6 +593,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+ %type <list>		hash_partbound
+ %type <defelt>		hash_partbound_elem
+ 
++%type <boolean> OraOptGlobal
++
+ /*
+  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
+  * They must be listed first so that their numeric codes do not depend on
+@@ -7171,7 +7173,7 @@ defacl_privilege_target:
+ 
+ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_index_name
+ 			ON relation_expr access_method_clause '(' index_params ')'
+-			opt_include opt_reloptions OptTableSpace where_clause
++			opt_include opt_reloptions OraOptGlobal OptTableSpace where_clause
+ 				{
+ 					IndexStmt *n = makeNode(IndexStmt);
+ 					n->unique = $2;
+@@ -7182,8 +7184,9 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_index_name
+ 					n->indexParams = $10;
+ 					n->indexIncludingParams = $12;
+ 					n->options = $13;
+-					n->tableSpace = $14;
+-					n->whereClause = $15;
++					n->global_index = $14;
++					n->tableSpace = $15;
++					n->whereClause = $16;
+ 					n->excludeOpNames = NIL;
+ 					n->idxcomment = NULL;
+ 					n->indexOid = InvalidOid;
+@@ -7201,7 +7204,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_index_name
+ 				}
+ 			| CREATE opt_unique INDEX opt_concurrently IF_P NOT EXISTS name
+ 			ON relation_expr access_method_clause '(' index_params ')'
+-			opt_include opt_reloptions OptTableSpace where_clause
++			opt_include opt_reloptions OraOptGlobal OptTableSpace where_clause
+ 				{
+ 					IndexStmt *n = makeNode(IndexStmt);
+ 					n->unique = $2;
+@@ -7212,8 +7215,9 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_index_name
+ 					n->indexParams = $13;
+ 					n->indexIncludingParams = $15;
+ 					n->options = $16;
+-					n->tableSpace = $17;
+-					n->whereClause = $18;
++					n->global_index = $17;
++					n->tableSpace = $18;
++					n->whereClause = $19;
+ 					n->excludeOpNames = NIL;
+ 					n->idxcomment = NULL;
+ 					n->indexOid = InvalidOid;
+@@ -7231,6 +7235,12 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_index_name
+ 				}
+ 		;
+ 
++OraOptGlobal: 
++	    LOCAL 					{ $$ = false; }
++			| GLOBAL 			{ $$ = true; }
++			| /*EMPTY*/				{ $$ = false; }
++		  ;
++
+ opt_unique:
+ 			UNIQUE									{ $$ = true; }
+ 			| /*EMPTY*/								{ $$ = false; }
+diff --git a/src/backend/partitioning/partdesc.c b/src/backend/partitioning/partdesc.c
+index 5b0a15ac0b..b7bdf61512 100644
+--- a/src/backend/partitioning/partdesc.c
++++ b/src/backend/partitioning/partdesc.c
+@@ -365,3 +365,39 @@ get_default_oid_from_partdesc(PartitionDesc partdesc)
+ 
+ 	return InvalidOid;
+ }
++
++Relation
++global_index_heaprel_lookup(PartitionDirectory pdir, Oid relid)
++{
++	PartitionDirectoryEntry *pde;
++	bool		found;
++	Relation	part_rel;
++
++	Assert(pdir);
++	pde = hash_search(pdir->pdir_hash, &relid, HASH_FIND, &found);
++	if (found)
++	{
++		part_rel = pde->rel;
++	}
++	else
++	{
++		pde = hash_search(pdir->pdir_hash, &relid, HASH_ENTER, &found);
++		part_rel = table_open(relid, AccessShareLock);
++		pde->rel = part_rel;
++		pde->pd = NULL;
++	}
++
++	return part_rel;
++}
++
++void
++destroy_partition_rel_directory(PartitionDirectory pdir)
++{
++	HASH_SEQ_STATUS status;
++	PartitionDirectoryEntry *pde;
++
++	hash_seq_init(&status, pdir->pdir_hash);
++	while ((pde = hash_seq_search(&status)) != NULL)
++		table_close(pde->rel, NoLock);
++}
++
+diff --git a/src/backend/replication/logical/worker.c b/src/backend/replication/logical/worker.c
+index 3874939380..e56abce879 100644
+--- a/src/backend/replication/logical/worker.c
++++ b/src/backend/replication/logical/worker.c
+@@ -1218,7 +1218,7 @@ static void
+ apply_handle_insert_internal(ResultRelInfo *relinfo,
+ 							 EState *estate, TupleTableSlot *remoteslot)
+ {
+-	ExecOpenIndices(relinfo, false);
++	ExecOpenIndices(estate, relinfo, false, true);
+ 
+ 	/* Do the insert. */
+ 	ExecSimpleRelationInsert(relinfo, estate, remoteslot);
+@@ -1377,7 +1377,7 @@ apply_handle_update_internal(ResultRelInfo *relinfo,
+ 	MemoryContext oldctx;
+ 
+ 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
+-	ExecOpenIndices(relinfo, false);
++	ExecOpenIndices(estate, relinfo, false, true);
+ 
+ 	found = FindReplTupleInLocalRel(estate, localrel,
+ 									&relmapentry->remoterel,
+@@ -1504,7 +1504,7 @@ apply_handle_delete_internal(ResultRelInfo *relinfo, EState *estate,
+ 	bool		found;
+ 
+ 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
+-	ExecOpenIndices(relinfo, false);
++	ExecOpenIndices(estate, relinfo, false, true);
+ 
+ 	found = FindReplTupleInLocalRel(estate, localrel, remoterel,
+ 									remoteslot, &localslot);
+@@ -1698,7 +1698,7 @@ apply_handle_tuple_routing(ResultRelInfo *relinfo,
+ 					EPQState	epqstate;
+ 
+ 					EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
+-					ExecOpenIndices(partrelinfo, false);
++					ExecOpenIndices(estate, partrelinfo, false, true);
+ 
+ 					EvalPlanQualSetSlot(&epqstate, remoteslot_part);
+ 					ExecSimpleRelationUpdate(partrelinfo, estate, &epqstate,
+diff --git a/src/backend/storage/page/itemptr.c b/src/backend/storage/page/itemptr.c
+index e7806cc60c..6dc4dcbc08 100644
+--- a/src/backend/storage/page/itemptr.c
++++ b/src/backend/storage/page/itemptr.c
+@@ -71,3 +71,18 @@ ItemPointerCompare(ItemPointer arg1, ItemPointer arg2)
+ 	else
+ 		return 0;
+ }
++
++void
++output_tid_info(Oid relid, ItemPointerData itemPtr, char *opt)
++{
++	BlockNumber blockNumber;
++	OffsetNumber offsetNumber;
++
++	return;
++
++	blockNumber = ItemPointerGetBlockNumberNoCheck(&itemPtr);
++	offsetNumber = ItemPointerGetOffsetNumberNoCheck(&itemPtr);
++
++	elog(WARNING, "rel %u %s tid (%u,%u)", relid, opt, blockNumber, offsetNumber);
++}
++
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index 80bd60f876..cb80a3f196 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -5604,6 +5604,9 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
+ 		if (index->relam != BTREE_AM_OID)
+ 			continue;
+ 
++		if (index->is_global_index)
++			continue;
++
+ 		/*
+ 		 * Ignore partial indexes --- we only want stats that cover the entire
+ 		 * relation.
+@@ -5811,6 +5814,8 @@ get_actual_variable_endpoint(Relation heapRel,
+ 	InitNonVacuumableSnapshot(SnapshotNonVacuumable,
+ 							  GlobalVisTestFor(heapRel));
+ 
++	Assert(!RELATION_INDEX_IS_GLOBAL_INDEX(indexRel));
++
+ 	index_scan = index_beginscan(heapRel, indexRel,
+ 								 &SnapshotNonVacuumable,
+ 								 1, 0);
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index 3bd5e18042..29198122c7 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -6404,3 +6404,31 @@ unlink_initfile(const char *initfilename, int elevel)
+ 							initfilename)));
+ 	}
+ }
++
++List *
++relation_get_global_index_list(Relation relation)
++{
++	ListCell	*l;
++	List		*indexs = NIL;
++	List		*global_indexs = NIL;
++
++	indexs = RelationGetIndexList(relation);
++	if (indexs == NIL)
++		return NIL;
++
++	foreach(l, indexs)
++	{
++		Oid			indexOid = lfirst_oid(l);
++		Relation	indexDesc;
++
++		indexDesc = index_open(indexOid, AccessShareLock);
++
++		if (RELATION_INDEX_IS_GLOBAL_INDEX(indexDesc))
++			global_indexs = lappend_oid(global_indexs, indexOid);
++
++		index_close(indexDesc, AccessShareLock);
++	}
++
++	return global_indexs;
++}
++
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index ed2ab4b5b2..f0129f9977 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -78,6 +78,8 @@ static Latch LocalLatchData;
+ 
+ bool		IgnoreSystemIndexes = false;
+ 
++bool		enable_global_index_scan = false;
++
+ 
+ /* ----------------------------------------------------------------
+  *	common process startup code
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index 878fcc2236..06d5604008 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -1867,6 +1867,17 @@ static struct config_bool ConfigureNamesBool[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"enable_global_index_scan", PGC_USERSET, QUERY_TUNING_METHOD,
++			gettext_noop("enable global index scan."),
++			NULL,
++			GUC_EXPLAIN
++		},
++		&enable_global_index_scan,
++		true,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"lo_compat_privileges", PGC_SUSET, COMPAT_OPTIONS_PREVIOUS,
+ 			gettext_noop("Enables backward compatibility mode for privilege checks on large objects."),
+diff --git a/src/include/access/amapi.h b/src/include/access/amapi.h
+index 85b4766016..1b6f854b10 100644
+--- a/src/include/access/amapi.h
++++ b/src/include/access/amapi.h
+@@ -104,7 +104,8 @@ typedef IndexBuildResult *(*ambuild_function) (Relation heapRelation,
+ typedef void (*ambuildempty_function) (Relation indexRelation);
+ 
+ /* insert this tuple */
+-typedef bool (*aminsert_function) (Relation indexRelation,
++typedef bool (*aminsert_function) (void *estate,
++								   Relation indexRelation,
+ 								   Datum *values,
+ 								   bool *isnull,
+ 								   ItemPointer heap_tid,
+diff --git a/src/include/access/brin_internal.h b/src/include/access/brin_internal.h
+index 9ffc9100c0..e2848cb909 100644
+--- a/src/include/access/brin_internal.h
++++ b/src/include/access/brin_internal.h
+@@ -88,7 +88,7 @@ extern void brin_free_desc(BrinDesc *bdesc);
+ extern IndexBuildResult *brinbuild(Relation heap, Relation index,
+ 								   struct IndexInfo *indexInfo);
+ extern void brinbuildempty(Relation index);
+-extern bool brininsert(Relation idxRel, Datum *values, bool *nulls,
++extern bool brininsert(void *estate, Relation idxRel, Datum *values, bool *nulls,
+ 					   ItemPointer heaptid, Relation heapRel,
+ 					   IndexUniqueCheck checkUnique,
+ 					   struct IndexInfo *indexInfo);
+diff --git a/src/include/access/genam.h b/src/include/access/genam.h
+index 68d90f5141..b6da0ba621 100644
+--- a/src/include/access/genam.h
++++ b/src/include/access/genam.h
+@@ -16,6 +16,8 @@
+ 
+ #include "access/sdir.h"
+ #include "access/skey.h"
++#include "access/itup.h"
++#include "access/relscan.h"
+ #include "nodes/tidbitmap.h"
+ #include "storage/lockdefs.h"
+ #include "utils/relcache.h"
+@@ -50,6 +52,8 @@ typedef struct IndexVacuumInfo
+ 	int			message_level;	/* ereport level for progress messages */
+ 	double		num_heap_tuples;	/* tuples remaining in heap */
+ 	BufferAccessStrategy strategy;	/* access strategy for reads */
++	bool		global_index;
++	Oid			heap_oid;
+ } IndexVacuumInfo;
+ 
+ /*
+@@ -138,7 +142,8 @@ typedef struct IndexOrderByDistance
+ extern Relation index_open(Oid relationId, LOCKMODE lockmode);
+ extern void index_close(Relation relation, LOCKMODE lockmode);
+ 
+-extern bool index_insert(Relation indexRelation,
++extern bool index_insert(void *estate, 
++						 Relation indexRelation,
+ 						 Datum *values, bool *isnull,
+ 						 ItemPointer heap_t_ctid,
+ 						 Relation heapRelation,
+@@ -191,6 +196,10 @@ extern void index_store_float8_orderby_distances(IndexScanDesc scan,
+ extern bytea *index_opclass_options(Relation relation, AttrNumber attnum,
+ 									Datum attoptions, bool validate);
+ 
++extern Oid global_index_itup_fetch_heap_oid(Relation index, IndexTuple itup);
++extern Relation GlobalIndexRelLookup(GlobalIndexRelDirectory pdir, Oid relid);
++extern void DestroyGlobalIndexRelDirectory(GlobalIndexRelDirectory pdir);
++extern GlobalIndexRelDirectory CreateGlobalIndexRelDirectory(MemoryContext mcxt);
+ 
+ /*
+  * index access method support routines (in genam.c)
+diff --git a/src/include/access/gin_private.h b/src/include/access/gin_private.h
+index 5cb2f72e4c..bd6794f9f9 100644
+--- a/src/include/access/gin_private.h
++++ b/src/include/access/gin_private.h
+@@ -113,7 +113,7 @@ extern Datum gintuple_get_key(GinState *ginstate, IndexTuple tuple,
+ extern IndexBuildResult *ginbuild(Relation heap, Relation index,
+ 								  struct IndexInfo *indexInfo);
+ extern void ginbuildempty(Relation index);
+-extern bool gininsert(Relation index, Datum *values, bool *isnull,
++extern bool gininsert(void *estate, Relation index, Datum *values, bool *isnull,
+ 					  ItemPointer ht_ctid, Relation heapRel,
+ 					  IndexUniqueCheck checkUnique,
+ 					  struct IndexInfo *indexInfo);
+diff --git a/src/include/access/gist_private.h b/src/include/access/gist_private.h
+index b68c01a5f2..3d1317d293 100644
+--- a/src/include/access/gist_private.h
++++ b/src/include/access/gist_private.h
+@@ -400,7 +400,7 @@ typedef struct GiSTOptions
+ 
+ /* gist.c */
+ extern void gistbuildempty(Relation index);
+-extern bool gistinsert(Relation r, Datum *values, bool *isnull,
++extern bool gistinsert(void *estate, Relation r, Datum *values, bool *isnull,
+ 					   ItemPointer ht_ctid, Relation heapRel,
+ 					   IndexUniqueCheck checkUnique,
+ 					   struct IndexInfo *indexInfo);
+diff --git a/src/include/access/hash.h b/src/include/access/hash.h
+index bab4d9f1b0..5bebf77971 100644
+--- a/src/include/access/hash.h
++++ b/src/include/access/hash.h
+@@ -361,7 +361,7 @@ typedef struct HashOptions
+ extern IndexBuildResult *hashbuild(Relation heap, Relation index,
+ 								   struct IndexInfo *indexInfo);
+ extern void hashbuildempty(Relation index);
+-extern bool hashinsert(Relation rel, Datum *values, bool *isnull,
++extern bool hashinsert(void *estate, Relation rel, Datum *values, bool *isnull,
+ 					   ItemPointer ht_ctid, Relation heapRel,
+ 					   IndexUniqueCheck checkUnique,
+ 					   struct IndexInfo *indexInfo);
+diff --git a/src/include/access/nbtree.h b/src/include/access/nbtree.h
+index e8fecc6026..61e457decc 100644
+--- a/src/include/access/nbtree.h
++++ b/src/include/access/nbtree.h
+@@ -963,6 +963,7 @@ typedef struct BTOptions
+ 	/* fraction of newly inserted tuples prior to trigger index cleanup */
+ 	float8		vacuum_cleanup_index_scale_factor;
+ 	bool		deduplicate_items;	/* Try to deduplicate items? */
++	bool		global_index;
+ } BTOptions;
+ 
+ #define BTGetFillFactor(relation) \
+@@ -993,7 +994,7 @@ typedef struct BTOptions
+  * external entry points for btree, in nbtree.c
+  */
+ extern void btbuildempty(Relation index);
+-extern bool btinsert(Relation rel, Datum *values, bool *isnull,
++extern bool btinsert(void *estate, Relation rel, Datum *values, bool *isnull,
+ 					 ItemPointer ht_ctid, Relation heapRel,
+ 					 IndexUniqueCheck checkUnique,
+ 					 struct IndexInfo *indexInfo);
+@@ -1043,7 +1044,7 @@ extern IndexTuple _bt_swap_posting(IndexTuple newitem, IndexTuple oposting,
+ /*
+  * prototypes for functions in nbtinsert.c
+  */
+-extern bool _bt_doinsert(Relation rel, IndexTuple itup,
++extern bool _bt_doinsert(void *estate, Relation rel, IndexTuple itup,
+ 						 IndexUniqueCheck checkUnique, Relation heapRel);
+ extern void _bt_finish_split(Relation rel, Buffer lbuf, BTStack stack);
+ extern Buffer _bt_getstackbuf(Relation rel, BTStack stack, BlockNumber child);
+diff --git a/src/include/access/relscan.h b/src/include/access/relscan.h
+index 5645976951..27dc3bc5c4 100644
+--- a/src/include/access/relscan.h
++++ b/src/include/access/relscan.h
+@@ -103,6 +103,8 @@ typedef struct IndexFetchTableData
+ 	Relation	rel;
+ } IndexFetchTableData;
+ 
++typedef struct GlobalIndexRelDirectoryData *GlobalIndexRelDirectory;
++
+ /*
+  * We use the same IndexScanDescData structure for both amgettuple-based
+  * and amgetbitmap-based index scans.  Some fields are only relevant in
+@@ -161,6 +163,9 @@ typedef struct IndexScanDescData
+ 
+ 	/* parallel index scan information, in shared memory */
+ 	struct ParallelIndexScanDescData *parallel_scan;
++
++	bool		xs_am_global_index;
++	GlobalIndexRelDirectory xs_globalindex_rel_directory;
+ }			IndexScanDescData;
+ 
+ /* Generic structure for parallel scans */
+diff --git a/src/include/access/spgist.h b/src/include/access/spgist.h
+index 9f2ccc1730..804f0f8a7f 100644
+--- a/src/include/access/spgist.h
++++ b/src/include/access/spgist.h
+@@ -196,7 +196,7 @@ extern bytea *spgoptions(Datum reloptions, bool validate);
+ extern IndexBuildResult *spgbuild(Relation heap, Relation index,
+ 								  struct IndexInfo *indexInfo);
+ extern void spgbuildempty(Relation index);
+-extern bool spginsert(Relation index, Datum *values, bool *isnull,
++extern bool spginsert(void *estate, Relation index, Datum *values, bool *isnull,
+ 					  ItemPointer ht_ctid, Relation heapRel,
+ 					  IndexUniqueCheck checkUnique,
+ 					  struct IndexInfo *indexInfo);
+diff --git a/src/include/executor/executor.h b/src/include/executor/executor.h
+index 0c48d2a519..c7a68c675c 100644
+--- a/src/include/executor/executor.h
++++ b/src/include/executor/executor.h
+@@ -577,7 +577,7 @@ extern TupleTableSlot *ExecGetReturningSlot(EState *estate, ResultRelInfo *relIn
+ /*
+  * prototypes from functions in execIndexing.c
+  */
+-extern void ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative);
++extern void ExecOpenIndices(EState *estate, ResultRelInfo *resultRelInfo, bool speculative, bool include_global_index);
+ extern void ExecCloseIndices(ResultRelInfo *resultRelInfo);
+ extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
+ 								   TupleTableSlot *slot, EState *estate,
+@@ -615,5 +615,6 @@ extern void CheckCmdReplicaIdentity(Relation rel, CmdType cmd);
+ 
+ extern void CheckSubscriptionRelkind(char relkind, const char *nspname,
+ 									 const char *relname);
++extern void ExecOpenGLobalIndex(EState *estate, ResultRelInfo *resultRelInfo, Oid global_index);
+ 
+ #endif							/* EXECUTOR_H  */
+diff --git a/src/include/miscadmin.h b/src/include/miscadmin.h
+index 72e3352398..184cb5fdab 100644
+--- a/src/include/miscadmin.h
++++ b/src/include/miscadmin.h
+@@ -453,6 +453,7 @@ extern PGDLLIMPORT bool process_shared_preload_libraries_in_progress;
+ extern char *session_preload_libraries_string;
+ extern char *shared_preload_libraries_string;
+ extern char *local_preload_libraries_string;
++extern bool enable_global_index_scan;
+ 
+ extern void CreateDataDirLockFile(bool amPostmaster);
+ extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster,
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 61ba4c3666..6980fba3b4 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -15,6 +15,7 @@
+ #define EXECNODES_H
+ 
+ #include "access/tupconvert.h"
++#include "access/relscan.h"
+ #include "executor/instrument.h"
+ #include "fmgr.h"
+ #include "lib/pairingheap.h"
+@@ -604,6 +605,8 @@ typedef struct EState
+ 	int			es_jit_flags;
+ 	struct JitContext *es_jit;
+ 	struct JitInstrumentation *es_jit_worker_instr;
++
++	GlobalIndexRelDirectory es_global_index_partrel_directory;
+ } EState;
+ 
+ 
+diff --git a/src/include/nodes/parsenodes.h b/src/include/nodes/parsenodes.h
+index 48a79a7657..88d5c27918 100644
+--- a/src/include/nodes/parsenodes.h
++++ b/src/include/nodes/parsenodes.h
+@@ -2796,6 +2796,7 @@ typedef struct IndexStmt
+ 	bool		if_not_exists;	/* just do nothing if index already exists? */
+ 	bool		reset_default_tblspc;	/* reset default_tablespace prior to
+ 										 * executing */
++	bool		global_index;
+ } IndexStmt;
+ 
+ /* ----------------------
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index b4059895de..d5771f6dbc 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -856,6 +856,8 @@ struct IndexOptInfo
+ 	bool		immediate;		/* is uniqueness enforced immediately? */
+ 	bool		hypothetical;	/* true if index doesn't really exist */
+ 
++	bool		is_global_index;
++
+ 	/* Remaining fields are copied from the index AM's API struct: */
+ 	bool		amcanorderbyop; /* does AM support order by operator result? */
+ 	bool		amoptionalkey;	/* can query omit key for the first column? */
+diff --git a/src/include/partitioning/partdesc.h b/src/include/partitioning/partdesc.h
+index 70df764981..20d1b2e14a 100644
+--- a/src/include/partitioning/partdesc.h
++++ b/src/include/partitioning/partdesc.h
+@@ -38,4 +38,7 @@ extern void DestroyPartitionDirectory(PartitionDirectory pdir);
+ 
+ extern Oid	get_default_oid_from_partdesc(PartitionDesc partdesc);
+ 
++extern Relation global_index_heaprel_lookup(PartitionDirectory pdir, Oid relid);
++extern void destroy_partition_rel_directory(PartitionDirectory pdir);
++
+ #endif							/* PARTCACHE_H */
+diff --git a/src/include/storage/itemptr.h b/src/include/storage/itemptr.h
+index 944f6fe6bd..43b28225ef 100644
+--- a/src/include/storage/itemptr.h
++++ b/src/include/storage/itemptr.h
+@@ -203,4 +203,6 @@ typedef ItemPointerData *ItemPointer;
+ extern bool ItemPointerEquals(ItemPointer pointer1, ItemPointer pointer2);
+ extern int32 ItemPointerCompare(ItemPointer arg1, ItemPointer arg2);
+ 
++extern void output_tid_info(Oid relid, ItemPointerData itemPtr, char *opt);
++
+ #endif							/* ITEMPTR_H */
+diff --git a/src/include/utils/rel.h b/src/include/utils/rel.h
+index c5ffea40f2..9674e161c1 100644
+--- a/src/include/utils/rel.h
++++ b/src/include/utils/rel.h
+@@ -16,6 +16,7 @@
+ 
+ #include "access/tupdesc.h"
+ #include "access/xlog.h"
++#include "catalog/pg_am.h"
+ #include "catalog/pg_class.h"
+ #include "catalog/pg_index.h"
+ #include "catalog/pg_publication.h"
+@@ -638,6 +639,10 @@ typedef struct ViewOptions
+ 	 RelationNeedsWAL(relation) && \
+ 	 !IsCatalogRelation(relation))
+ 
++#define RELATION_IS_PARTITION(relation)	((relation)->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
++
++extern bool RELATION_INDEX_IS_GLOBAL_INDEX(Relation relation);
++
+ /* routines in utils/cache/relcache.c */
+ extern void RelationIncrementReferenceCount(Relation rel);
+ extern void RelationDecrementReferenceCount(Relation rel);
+diff --git a/src/include/utils/relcache.h b/src/include/utils/relcache.h
+index 9a85b7dd57..e468f3d501 100644
+--- a/src/include/utils/relcache.h
++++ b/src/include/utils/relcache.h
+@@ -53,6 +53,7 @@ extern List *RelationGetDummyIndexExpressions(Relation relation);
+ extern List *RelationGetIndexPredicate(Relation relation);
+ extern Datum *RelationGetIndexRawAttOptions(Relation relation);
+ extern bytea **RelationGetIndexAttOptions(Relation relation, bool copy);
++extern List *relation_get_global_index_list(Relation relation);
+ 
+ typedef enum IndexAttrBitmapKind
+ {
+diff --git a/src/test/regress/expected/sysviews.out b/src/test/regress/expected/sysviews.out
+index 81bdacf59d..c2f021f273 100644
+--- a/src/test/regress/expected/sysviews.out
++++ b/src/test/regress/expected/sysviews.out
+@@ -90,6 +90,7 @@ select name, setting from pg_settings where name like 'enable%';
+ --------------------------------+---------
+  enable_bitmapscan              | on
+  enable_gathermerge             | on
++ enable_global_index_scan       | on
+  enable_hashagg                 | on
+  enable_hashjoin                | on
+  enable_incremental_sort        | on
+@@ -106,7 +107,7 @@ select name, setting from pg_settings where name like 'enable%';
+  enable_seqscan                 | on
+  enable_sort                    | on
+  enable_tidscan                 | on
+-(18 rows)
++(19 rows)
+ 
+ -- Test that the pg_timezone_names and pg_timezone_abbrevs views are
+ -- more-or-less working.  We can't test their contents in any great detail
